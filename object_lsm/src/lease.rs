@@ -48,6 +48,13 @@ impl Default for LeaseOptions {
   }
 }
 
+fn epoch_now() -> u128 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_nanos()
+}
+
 fn now_ms() -> u128 {
   std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
@@ -55,21 +62,28 @@ fn now_ms() -> u128 {
     .as_millis()
 }
 
-fn payload(owner: &str, ttl_ms: u128) -> Vec<u8> {
-  format!("{owner}\n{}", now_ms() + ttl_ms).into_bytes()
+fn payload(owner: &str, ttl_ms: u128, epoch: u128) -> Vec<u8> {
+  format!("{owner}\n{}\n{epoch}", now_ms() + ttl_ms).into_bytes()
 }
 
-fn parse_payload(bytes: &[u8]) -> Result<(String, u128)> {
+fn parse_payload(bytes: &[u8]) -> Result<(String, u128, u128)> {
   let text =
     std::str::from_utf8(bytes).map_err(|e| Error::Corrupt(format!("lease not utf-8: {e}")))?;
-  let (owner, expiry) = text
-    .split_once('\n')
+  let mut parts = text.split('\n');
+  let owner = parts
+    .next()
     .ok_or_else(|| Error::Corrupt("lease payload malformed".into()))?;
-  let expiry_ms: u128 = expiry
+  let expiry_ms: u128 = parts
+    .next()
+    .ok_or_else(|| Error::Corrupt("lease payload malformed".into()))?
     .trim()
     .parse()
     .map_err(|_| Error::Corrupt("lease expiry malformed".into()))?;
-  Ok((owner.to_string(), expiry_ms))
+  let epoch: u128 = parts
+    .next()
+    .map(|s| s.trim().parse().unwrap_or(0))
+    .unwrap_or(0);
+  Ok((owner.to_string(), expiry_ms, epoch))
 }
 
 struct LeaseInner {
@@ -77,6 +91,7 @@ struct LeaseInner {
   key: String,
   owner: String,
   ttl_ms: u128,
+  epoch: u128,
   stop: AtomicBool,
   lost: Arc<AtomicBool>,
   /// Serializes renew / release / heartbeat get-check-write sequences within
@@ -106,14 +121,15 @@ impl Lease {
   pub fn acquire(store: Arc<dyn Store>, prefix: &str, opts: LeaseOptions) -> Result<Self> {
     let key = lease_key(prefix);
     let ttl_ms = opts.ttl.as_millis().max(1);
+    let epoch = epoch_now();
     let deadline = Instant::now() + opts.timeout;
     loop {
       match store.get(&key) {
         Ok(None) => {
-          if store.create(&key, &payload(&opts.owner, ttl_ms))? {
+          if store.create(&key, &payload(&opts.owner, ttl_ms, epoch))? {
             // Verify we still own the lease; a concurrent stale-takeover may
             // have deleted us already (best-effort fencing).
-            let owned = matches!(store.get(&key)?, Some(b) if parse_payload(&b).ok().map(|(o, _)| o) == Some(opts.owner.clone()));
+            let owned = matches!(store.get(&key)?, Some(b) if parse_payload(&b).ok().map(|(o, _, _)| o) == Some(opts.owner.clone()));
             if owned {
               break;
             }
@@ -123,9 +139,9 @@ impl Lease {
           // Atomically take over an expired lease with compare-and-swap: it
           // only succeeds if the object still holds the exact expired payload
           // we just read, so two contenders cannot both win.
-          if let Ok((_, expiry)) = parse_payload(&bytes)
+          if let Ok((_, expiry, _)) = parse_payload(&bytes)
             && expiry <= now_ms()
-            && store.put_if_matches(&key, &bytes, &payload(&opts.owner, ttl_ms))?
+            && store.put_if_matches(&key, &bytes, &payload(&opts.owner, ttl_ms, epoch))?
           {
             break;
           }
@@ -144,6 +160,7 @@ impl Lease {
       key,
       owner: opts.owner.clone(),
       ttl_ms,
+      epoch,
       stop: AtomicBool::new(false),
       lost: Arc::new(AtomicBool::new(false)),
       op: parking_lot::Mutex::new(()),
@@ -166,6 +183,12 @@ impl Lease {
     self.inner.lost.load(Ordering::SeqCst)
   }
 
+  /// Fencing epoch: monotonically unique per acquisition, embedded in every
+  /// journal group and manifest publish for strong visibility fencing.
+  pub fn epoch(&self) -> u128 {
+    self.inner.epoch
+  }
+
   /// Shared lost flag for the engine's best-effort write fencing.
   pub fn lost_flag(&self) -> Arc<AtomicBool> {
     self.inner.lost.clone()
@@ -181,7 +204,7 @@ impl Lease {
         Ok(false)
       }
       Some(bytes) => {
-        let (owner, _) = parse_payload(&bytes)?;
+        let (owner, ..) = parse_payload(&bytes)?;
         if owner != self.inner.owner {
           self.inner.lost.store(true, Ordering::SeqCst);
           return Ok(false);
@@ -189,7 +212,7 @@ impl Lease {
         let renewed = store.put_if_matches(
           &self.inner.key,
           &bytes,
-          &payload(&self.inner.owner, self.inner.ttl_ms),
+          &payload(&self.inner.owner, self.inner.ttl_ms, self.inner.epoch),
         )?;
         if !renewed {
           self.inner.lost.store(true, Ordering::SeqCst);
@@ -207,7 +230,7 @@ impl Lease {
     self.inner.stop.store(true, Ordering::SeqCst);
     let _g = self.inner.op.lock();
     if let Ok(Some(bytes)) = self.inner.store.get(&self.inner.key)
-      && let Ok((owner, _)) = parse_payload(&bytes)
+      && let Ok((owner, ..)) = parse_payload(&bytes)
       && owner == self.inner.owner
     {
       let _ = self.inner.store.delete(&self.inner.key);
@@ -240,9 +263,13 @@ fn spawn_heartbeat(inner: Arc<LeaseInner>, stop_rx: std::sync::mpsc::Receiver<()
         let _g = inner.op.lock();
         let ok = match inner.store.get(&inner.key) {
           Ok(Some(bytes)) => match parse_payload(&bytes) {
-            Ok((owner, _)) if owner == inner.owner => inner
+            Ok((owner, ..)) if owner == inner.owner => inner
               .store
-              .put_if_matches(&inner.key, &bytes, &payload(&inner.owner, inner.ttl_ms))
+              .put_if_matches(
+                &inner.key,
+                &bytes,
+                &payload(&inner.owner, inner.ttl_ms, inner.epoch),
+              )
               .unwrap_or(false),
             _ => false,
           },

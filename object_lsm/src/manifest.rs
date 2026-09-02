@@ -21,6 +21,9 @@ pub struct Manifest {
   pub next_journal_seq: u64,
   /// Per-partition durable metadata.
   pub partitions: BTreeMap<String, PartitionMeta>,
+  /// Fencing epoch of the writer (0 = unfenced).
+  #[serde(default)]
+  pub fence_epoch: u128,
 }
 
 impl Manifest {

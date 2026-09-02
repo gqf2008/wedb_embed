@@ -74,6 +74,10 @@ fn leased_engine_is_exclusive_writer() {
     "second writer must be rejected: {err}"
   );
 
+  // With epoch fencing, only manifest-published state survives a writer
+  // handoff; flush the memtable first (unflushed old-epoch journal groups are
+  // intentionally fenced off for the new writer).
+  e1.compact().unwrap();
   drop(e1); // releases the lease
   let e3 =
     ObjectLsm::open_leased(Arc::new(s.clone()), Config::new("l/eng"), opts("w3", false)).unwrap();

@@ -110,6 +110,10 @@ impl ObjectLsm {
   pub fn open_leased(store: Arc<dyn Store>, cfg: Config, opts: LeaseOptions) -> Result<Self> {
     let lease = Lease::acquire(store.clone(), &cfg.prefix, opts)?;
     let mut engine = Self::build(store, cfg)?;
+    {
+      let mut st = engine.inner.state.write();
+      st.fence_epoch = lease.epoch();
+    }
     *engine.inner.lease_lost.lock() = Some(lease.lost_flag());
     engine.lease = Some(Arc::new(lease));
     Ok(engine)
@@ -181,10 +185,24 @@ fn recover(
   if let Some(cur) = store.get(&current_key(prefix))? {
     let text =
       std::str::from_utf8(&cur).map_err(|e| Error::Corrupt(format!("current not utf-8: {e}")))?;
-    let mseq: u64 = text
+    let (seq_text, epoch) = match text.split_once('\n') {
+      Some((seq, epoch)) => (
+        seq,
+        Some(
+          epoch
+            .trim()
+            .parse::<u128>()
+            .map_err(|e| Error::Corrupt(format!("current epoch: {e}")))?,
+        ),
+      ),
+      None => (text, None),
+    };
+    let mseq: u64 = seq_text
       .trim()
       .parse()
       .map_err(|e| Error::Corrupt(format!("current not a seq: {e}")))?;
+    st.fence_epoch = epoch.unwrap_or(0);
+    st.current_bytes = Some(cur.clone());
     let man_bytes = store
       .get(&manifest_key(prefix, mseq))?
       .ok_or_else(|| Error::Corrupt(format!("manifest {mseq} missing")))?;
@@ -233,6 +251,9 @@ fn recover(
     };
     st.journal_sizes.insert(s, bytes.len() as u64);
     for group in decode_group_stream(&bytes)? {
+      if group.epoch != st.fence_epoch {
+        continue;
+      }
       apply_group_recover(&mut st, &group, partitions)?;
     }
   }
@@ -294,6 +315,7 @@ fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
     seq: st.manifest_seq + 1,
     next_segment_id: st.next_segment_id,
     next_journal_seq: st.journal_seq,
+    fence_epoch: st.fence_epoch,
     partitions: BTreeMap::new(),
   };
   for (name, pm) in &st.partitions {
@@ -303,7 +325,26 @@ fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
   let bytes = man.encode()?;
   st.manifest_bytes = bytes.len() as u64;
   store.put(&manifest_key(&st.cfg.prefix, man.seq), &bytes)?;
-  store.put(&current_key(&st.cfg.prefix), man.seq.to_string().as_bytes())?;
+
+  let new_current = if st.fence_epoch != 0 {
+    format!("{}\n{}", man.seq, st.fence_epoch).into_bytes()
+  } else {
+    man.seq.to_string().into_bytes()
+  };
+  if st.fence_epoch != 0 {
+    let ok = match &st.current_bytes {
+      Some(expected) => {
+        store.put_if_matches(&current_key(&st.cfg.prefix), expected, &new_current)?
+      }
+      None => store.create(&current_key(&st.cfg.prefix), &new_current)?,
+    };
+    if !ok {
+      return Err(Error::store("fenced: manifest current changed"));
+    }
+  } else {
+    store.put(&current_key(&st.cfg.prefix), &new_current)?;
+  }
+  st.current_bytes = Some(new_current);
   Ok(())
 }
 
@@ -644,7 +685,11 @@ impl Inner {
       let mut st = self.state.write();
       let seq = st.journal_seq + 1;
       st.journal_seq = seq;
-      let group = Group { seq, ops };
+      let group = Group {
+        seq,
+        epoch: st.fence_epoch,
+        ops,
+      };
       let bytes = encode_group(&group)?;
       let strict_put = if st.cfg.journal_window_ms.is_none() {
         Some((journal_key(&st.cfg.prefix, seq), bytes))

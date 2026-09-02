@@ -233,6 +233,10 @@ pub struct EngineState {
   pub pending_lo: u64,
   /// Completed merge compactions (metrics).
   pub compactions_completed: u64,
+  /// Fencing epoch for leased engines (0 = unfenced).
+  pub fence_epoch: u128,
+  /// Raw bytes of the current manifest pointer as last seen/published.
+  pub current_bytes: Option<Vec<u8>>,
 }
 
 impl EngineState {
@@ -249,6 +253,8 @@ impl EngineState {
       compactions_completed: 0,
       pending: Vec::new(),
       pending_lo: 0,
+      fence_epoch: 0,
+      current_bytes: None,
     }
   }
 

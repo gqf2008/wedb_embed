@@ -123,8 +123,14 @@ ObjectLsm::open_leased(store.clone(), cfg1, lease("w1"))?;
 Notes: stale-lease takeover and renewal use an atomic compare-and-swap
 (`Store::put_if_matches`): the lease is replaced only if its current payload is
 unchanged. `MemoryStore` compares bytes directly; `R2Store` maps it to S3
-`If-Match` using the single-part object ETag (MD5). Lost-lease detection is
-still best-effort heartbeat-based. Each shard is a separate engine instance —
+`If-Match` using the single-part object ETag (MD5). Each acquisition carries a
+monotonic **fencing epoch** embedded in every journal group and in the
+manifest; manifest publishing performs a conditional update of the `current`
+pointer (CAS), so only one epoch's state is ever visible, and recovery ignores
+journal groups from a different epoch. On writer handoff, unflushed
+old-epoch journal groups are fenced off — call `compact`/`persist` before
+releasing the lease to make state durable across a takeover. Lost-lease
+detection remains heartbeat-based. Each shard is a separate engine instance —
 cross-shard queries/cluster routing stay an application concern (as in Redis
 Cluster).
 
@@ -141,5 +147,6 @@ Cluster).
 - dropping the engine (windowed group-commit) flushes the pending journal
   before stopping the background flusher, so a clean shutdown does not lose
   acknowledged writes.
+
 
 

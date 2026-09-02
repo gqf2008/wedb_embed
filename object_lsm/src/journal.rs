@@ -50,6 +50,8 @@ impl Op {
 pub struct Group {
   /// Monotonic sequence assigned at commit time.
   pub seq: u64,
+  /// Fencing epoch (0 for unfenced engines).
+  pub epoch: u128,
   pub ops: Vec<Op>,
 }
 
@@ -57,6 +59,8 @@ pub fn encode_group(g: &Group) -> Result<Vec<u8>> {
   let mut out = Vec::with_capacity(64 + g.ops.len() * 32);
   put_u32(&mut out, GROUP_MAGIC);
   put_u64(&mut out, g.seq);
+  put_u64(&mut out, (g.epoch >> 64) as u64);
+  put_u64(&mut out, g.epoch as u64);
   put_u32(&mut out, g.ops.len() as u32);
   for op in &g.ops {
     put_str(&mut out, &op.part)?;
@@ -79,6 +83,7 @@ fn read_group(r: &mut Reader<'_>) -> Result<Group> {
     return Err(Error::Corrupt(format!("bad journal magic {magic:#x}")));
   }
   let seq = r.u64()?;
+  let epoch = ((r.u64()? as u128) << 64) | (r.u64()? as u128);
   let count = r.u32()?;
   let mut ops = Vec::with_capacity(count as usize);
   for _ in 0..count {
@@ -92,7 +97,7 @@ fn read_group(r: &mut Reader<'_>) -> Result<Group> {
     };
     ops.push(Op { part, key, value });
   }
-  Ok(Group { seq, ops })
+  Ok(Group { seq, epoch, ops })
 }
 
 pub fn decode_group(buf: &[u8]) -> Result<Group> {
