@@ -26,13 +26,13 @@ use crate::{
     segment_key, segment_root,
   },
   lease::{Lease, LeaseOptions},
-  manifest::{Manifest, PartitionMeta},
+  manifest::Manifest,
   partition::ObjectLsmPartition,
   segment::{
     BLOCK_HEADER_LEN, BlockMeta, SegmentEntries, SegmentIndex, SegmentMeta, TAIL_LEN,
     build_segment_meta, decode_block, decode_index, encode_segment, find_block, parse_tail,
   },
-  state::{EngineState, MemEntry, PartitionLock, PartitionState},
+  state::{EngineState, MemEntry, PartitionLock, PartitionState, PartitionTable},
   store::Store,
 };
 
@@ -40,6 +40,8 @@ use crate::{
 pub struct Inner {
   pub store: Arc<dyn Store>,
   pub state: RwLock<EngineState>,
+  /// Per-partition data-plane lock table (independent of `state`'s lock).
+  pub partitions: PartitionTable,
   pub block_cache: BlockCache,
   pub index_cache: IndexCache,
   /// Stops the background group-commit journal flusher thread.
@@ -107,10 +109,12 @@ impl ObjectLsm {
   fn build(store: Arc<dyn Store>, cfg: Config) -> Result<Self> {
     let block_cache = BlockCache::new(cfg.cache_capacity);
     let index_cache = IndexCache::default();
-    let state = recover(&*store, &cfg, &index_cache)?;
+    let partitions = PartitionTable::default();
+    let state = recover(&*store, &cfg, &index_cache, &partitions)?;
     let inner = Arc::new(Inner {
       store,
       state: RwLock::new(state),
+      partitions,
       block_cache,
       index_cache,
       journal_stop: AtomicBool::new(false),
@@ -145,7 +149,12 @@ fn sync_partition_meta(st: &mut EngineState, ps: &PartitionState) {
 
 /// Rebuild in-memory state from the durable manifest + journal tail, then run
 /// startup compaction/GC.
-fn recover(store: &dyn Store, cfg: &Config, index_cache: &IndexCache) -> Result<EngineState> {
+fn recover(
+  store: &dyn Store,
+  cfg: &Config,
+  index_cache: &IndexCache,
+  partitions: &PartitionTable,
+) -> Result<EngineState> {
   let mut st = EngineState::new(cfg.clone());
   let prefix = &cfg.prefix;
 
@@ -169,17 +178,9 @@ fn recover(store: &dyn Store, cfg: &Config, index_cache: &IndexCache) -> Result<
           index_cache.insert(seg.id, Arc::new(index.clone()));
         }
       }
-      let meta = pm.clone();
-      st.partitions.insert(name.clone(), pm);
-      st.partition_locks.insert(
-        name.clone(),
-        Arc::new(RwLock::new(PartitionState {
-          name,
-          mem: BTreeMap::new(),
-          mem_bytes: 0,
-          meta,
-        })),
-      );
+      let lock = partitions.create(&name);
+      lock.write().meta = pm.clone();
+      st.partitions.insert(name, pm);
     }
   }
 
@@ -211,29 +212,25 @@ fn recover(store: &dyn Store, cfg: &Config, index_cache: &IndexCache) -> Result<
       continue;
     };
     for group in decode_group_stream(&bytes)? {
-      apply_group_recover(&mut st, &group)?;
+      apply_group_recover(&mut st, &group, partitions)?;
     }
   }
 
   // Flush replayed memtables that already exceeded the budget.
-  let over: Vec<String> = st
-    .partition_locks
+  let over: Vec<String> = partitions
+    .snapshot()
     .iter()
-    .filter_map(|(name, lock)| {
+    .filter_map(|lock| {
       let ps = lock.read();
-      (!ps.meta.dropped && ps.mem_bytes > cfg.max_memtable_bytes).then(|| name.clone())
+      (!ps.meta.dropped && ps.mem_bytes > cfg.max_memtable_bytes).then(|| ps.name.clone())
     })
     .collect();
   for name in over {
-    let lock = st
-      .partition_locks
-      .get(&name)
-      .cloned()
-      .expect("partition present");
+    let lock = partitions.get(&name).expect("partition present");
     let mut ps = lock.write();
     flush_partition(store, &mut st, &mut ps)?;
   }
-  maybe_compact_all_state(store, &mut st)?;
+  maybe_compact_all_state(store, &mut st, partitions)?;
   gc_journal(store, &mut st);
   gc_objects_at_open(store, &mut st)?;
   Ok(st)
@@ -241,7 +238,11 @@ fn recover(store: &dyn Store, cfg: &Config, index_cache: &IndexCache) -> Result<
 
 /// Apply a committed group during recovery. Unlike the online commit path,
 /// this is single-threaded startup state construction.
-fn apply_group_recover(st: &mut EngineState, group: &Group) -> Result<()> {
+fn apply_group_recover(
+  st: &mut EngineState,
+  group: &Group,
+  partitions: &PartitionTable,
+) -> Result<()> {
   for op in &group.ops {
     let wm = st
       .partitions
@@ -251,16 +252,10 @@ fn apply_group_recover(st: &mut EngineState, group: &Group) -> Result<()> {
     if group.seq <= wm {
       continue;
     }
-    if !st.partition_locks.contains_key(&op.part) {
-      st.insert_partition(op.part.clone());
-    }
-    let lock = st
-      .partition_locks
-      .get(&op.part)
-      .cloned()
-      .expect("partition present");
+    let lock = partitions.create(&op.part);
     let mut ps = lock.write();
     ps.apply(&op.key, op.value.as_deref());
+    st.ensure_meta(&op.part);
   }
   Ok(())
 }
@@ -409,15 +404,16 @@ fn compact_partition_locked(
 }
 
 /// Compact every partition that reached the configured segment limit.
-fn maybe_compact_all_state(store: &dyn Store, st: &mut EngineState) -> Result<()> {
+fn maybe_compact_all_state(
+  store: &dyn Store,
+  st: &mut EngineState,
+  partitions: &PartitionTable,
+) -> Result<()> {
   let limit = st.cfg.max_segments_before_compact;
-  let names: Vec<String> = st.partition_locks.keys().cloned().collect();
-  for name in names {
-    let lock = st
-      .partition_locks
-      .get(&name)
-      .cloned()
-      .expect("partition present");
+  for name in partitions.names() {
+    let Some(lock) = partitions.get(&name) else {
+      continue;
+    };
     let mut ps = lock.write();
     if !ps.meta.dropped && ps.meta.segments.len() >= limit {
       compact_partition_locked(store, st, &mut ps)?;
@@ -532,30 +528,23 @@ fn spawn_journal_flusher(inner: Arc<Inner>) {
 
 impl Inner {
   pub(crate) fn partition_lock(&self, name: &str) -> Option<PartitionLock> {
-    self.state.read().partition_locks.get(name).cloned()
+    self.partitions.get(name)
   }
 
   fn ensure_partitions(&self, names: &[String]) {
+    for name in names {
+      self.partitions.create(name);
+    }
     let mut st = self.state.write();
     for name in names {
-      if !st.partition_locks.contains_key(name) {
-        st.insert_partition(name.clone());
-      } else if !st.partitions.contains_key(name) {
-        st.partitions.insert(name.clone(), PartitionMeta::default());
-      }
+      st.ensure_meta(name);
     }
   }
 
   fn partition_locks(&self, names: &[String]) -> BTreeMap<String, PartitionLock> {
-    let st = self.state.read();
     names
       .iter()
-      .filter_map(|name| {
-        st.partition_locks
-          .get(name)
-          .cloned()
-          .map(|lock| (name.clone(), lock))
-      })
+      .filter_map(|name| self.partitions.get(name).map(|lock| (name.clone(), lock)))
       .collect()
   }
 
@@ -641,26 +630,18 @@ impl Inner {
   /// Ensure a partition exists and is not marked dropped (re-create clears the
   /// dropped flag, keeping its watermark to avoid stale journal replays).
   pub(crate) fn touch_partition(&self, name: &str) -> Result<()> {
-    let existing = self.partition_lock(name);
-    match existing {
-      Some(lock) => {
-        let mut ps = lock.write();
-        if ps.meta.dropped {
-          ps.meta.dropped = false;
-          let mut st = self.state.write();
-          sync_partition_meta(&mut st, &ps);
-          publish_manifest(&*self.store, &mut st)?;
-        }
-        Ok(())
-      }
-      None => {
-        let mut st = self.state.write();
-        if !st.partition_locks.contains_key(name) {
-          st.insert_partition(name.to_string());
-        }
-        Ok(())
-      }
+    let lock = self.partitions.create(name);
+    let mut ps = lock.write();
+    if ps.meta.dropped {
+      ps.meta.dropped = false;
+      let mut st = self.state.write();
+      sync_partition_meta(&mut st, &ps);
+      publish_manifest(&*self.store, &mut st)?;
+    } else {
+      let mut st = self.state.write();
+      st.ensure_meta(name);
     }
+    Ok(())
   }
 
   /// Load (and cache) the block index of a segment via tail + index Range GETs.
@@ -731,11 +712,8 @@ impl Inner {
   /// Point lookup: memtable, then segments newest -> oldest using the block
   /// index to fetch only the candidate block.
   pub(crate) fn lookup(&self, name: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    let (prefix, lock) = {
-      let st = self.state.read();
-      (st.cfg.prefix.clone(), st.partition_locks.get(name).cloned())
-    };
-    let Some(lock) = lock else {
+    let prefix = self.state.read().cfg.prefix.clone();
+    let Some(lock) = self.partitions.get(name) else {
       return Ok(None);
     };
     let segments = {
@@ -834,7 +812,7 @@ impl Inner {
 
   /// Flush + merge-compact every non-dropped partition.
   pub(crate) fn compact_all(&self) -> Result<()> {
-    let names: Vec<String> = self.state.read().partition_locks.keys().cloned().collect();
+    let names = self.partitions.names();
     for name in names {
       let Some(lock) = self.partition_lock(&name) else {
         continue;
@@ -866,11 +844,9 @@ impl Engine for ObjectLsm {
   fn partition_exists(&self, name: &str) -> bool {
     self
       .inner
-      .state
-      .read()
       .partitions
       .get(name)
-      .map(|pm| !pm.dropped)
+      .map(|lock| !lock.read().meta.dropped)
       .unwrap_or(false)
   }
 
@@ -878,12 +854,11 @@ impl Engine for ObjectLsm {
     Ok(
       self
         .inner
-        .state
-        .read()
         .partitions
+        .snapshot()
         .iter()
-        .filter(|(_, pm)| !pm.dropped)
-        .map(|(name, _)| name.clone())
+        .filter(|lock| !lock.read().meta.dropped)
+        .map(|lock| lock.read().name.clone())
         .collect(),
     )
   }
@@ -893,15 +868,13 @@ impl Engine for ObjectLsm {
   }
 
   fn write_buffer_size(&self) -> u64 {
-    let locks: Vec<PartitionLock> = self
+    self
       .inner
-      .state
-      .read()
-      .partition_locks
-      .values()
-      .cloned()
-      .collect();
-    locks.iter().map(|lock| lock.read().mem_bytes).sum()
+      .partitions
+      .snapshot()
+      .iter()
+      .map(|lock| lock.read().mem_bytes)
+      .sum()
   }
 
   fn cache_size(&self) -> u64 {
@@ -937,16 +910,11 @@ impl Engine for ObjectLsm {
   }
 
   fn disk_space(&self) -> Result<u64> {
-    let locks: Vec<PartitionLock> = self
-      .inner
-      .state
-      .read()
-      .partition_locks
-      .values()
-      .cloned()
-      .collect();
     Ok(
-      locks
+      self
+        .inner
+        .partitions
+        .snapshot()
         .iter()
         .map(|lock| {
           let ps = lock.read();

@@ -73,19 +73,57 @@ impl PartitionState {
 /// Shared, independently lockable partition state.
 pub type PartitionLock = Arc<RwLock<PartitionState>>;
 
+/// Lock table for the per-partition data plane.
+///
+/// This lives *outside* [`EngineState`]'s global lock: acquiring a partition
+/// lock never blocks on a writer holding the global metadata lock, which is
+/// what lets reads/writes to unrelated partitions proceed while one partition
+/// flushes or compacts.
+#[derive(Debug, Default)]
+pub struct PartitionTable {
+  map: RwLock<BTreeMap<String, PartitionLock>>,
+}
+
+impl PartitionTable {
+  /// Return a clone of the lock for `name`, if it exists.
+  pub fn get(&self, name: &str) -> Option<PartitionLock> {
+    self.map.read().get(name).cloned()
+  }
+
+  /// Return (and create, if missing) the lock for `name`.
+  pub fn create(&self, name: &str) -> PartitionLock {
+    if let Some(lock) = self.get(name) {
+      return lock;
+    }
+    let lock = Arc::new(RwLock::new(PartitionState::new(name.to_string())));
+    let mut map = self.map.write();
+    map
+      .entry(name.to_string())
+      .or_insert_with(|| lock.clone())
+      .clone()
+  }
+
+  /// Snapshot every lock currently in the table.
+  pub fn snapshot(&self) -> Vec<PartitionLock> {
+    self.map.read().values().cloned().collect()
+  }
+
+  /// All partition names currently in the table.
+  pub fn names(&self) -> Vec<String> {
+    self.map.read().keys().cloned().collect()
+  }
+}
+
 /// Whole-engine state guarded by a single read/write lock.
 ///
 /// Only global metadata lives here. `partitions` is the durable/manifest view;
-/// `partition_locks` is the per-partition data-plane lock table. Partition
-/// memtables are mutated while holding the corresponding partition lock, never
-/// while holding this global lock.
+/// per-partition memtables are mutated while holding the corresponding
+/// [`PartitionTable`] lock, never while holding this global lock.
 #[derive(Debug)]
 pub struct EngineState {
   pub cfg: Config,
   /// Durable per-partition metadata used by manifest publishing and GC.
   pub partitions: BTreeMap<String, PartitionMeta>,
-  /// Lock table for partition data plane.
-  pub partition_locks: BTreeMap<String, PartitionLock>,
   /// Last assigned journal group seq (0 = none).
   pub journal_seq: u64,
   /// Last manifest seq written (0 = none).
@@ -106,7 +144,6 @@ impl EngineState {
     Self {
       cfg,
       partitions: BTreeMap::new(),
-      partition_locks: BTreeMap::new(),
       journal_seq: 0,
       manifest_seq: 0,
       next_segment_id: 0,
@@ -117,13 +154,8 @@ impl EngineState {
     }
   }
 
-  /// Insert a brand-new partition into both the lock table and the durable
-  /// metadata mirror. Callers must hold the global write lock.
-  pub fn insert_partition(&mut self, name: impl Into<String>) -> PartitionLock {
-    let name = name.into();
-    let lock = Arc::new(RwLock::new(PartitionState::new(name.clone())));
-    self.partition_locks.insert(name.clone(), lock.clone());
-    self.partitions.insert(name, PartitionMeta::default());
-    lock
+  /// Ensure a durable metadata mirror entry exists for `name`.
+  pub fn ensure_meta(&mut self, name: &str) {
+    self.partitions.entry(name.to_string()).or_default();
   }
 }

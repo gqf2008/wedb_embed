@@ -84,11 +84,8 @@ struct Snap {
 }
 
 fn snapshot(inner: &Arc<Inner>, part: &str, b: &Bounds) -> Snap {
-  let (prefix, lock) = {
-    let st = inner.state.read();
-    (st.cfg.prefix.clone(), st.partition_locks.get(part).cloned())
-  };
-  let Some(lock) = lock else {
+  let prefix = inner.state.read().cfg.prefix.clone();
+  let Some(lock) = inner.partitions.get(part) else {
     return Snap {
       prefix,
       mem: Vec::new(),
