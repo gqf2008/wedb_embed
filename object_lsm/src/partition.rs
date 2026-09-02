@@ -232,14 +232,15 @@ impl Partition for ObjectLsmPartition {
   }
 
   fn approximate_len(&self) -> Result<usize> {
-    let st = self.inner.state.read();
-    let Some(ps) = st.partitions.get(&self.name) else {
+    let Some(lock) = self.inner.partition_lock(&self.name) else {
       return Ok(0);
     };
+    let ps = lock.read();
     // O(#segments + memtable), never a full partition scan: live values in the
     // memtable plus per-segment raw entries minus tombstones (duplicates across
     // segments intentionally overcount, matching an approximate LSM count).
     let seg: usize = ps
+      .meta
       .segments
       .iter()
       .map(|s| (s.count - s.tombstones) as usize)
@@ -255,20 +256,25 @@ impl Partition for ObjectLsmPartition {
   fn table_count(&self) -> usize {
     self
       .inner
-      .state
-      .read()
-      .partitions
-      .get(&self.name)
-      .map(|p| p.segments.len())
+      .partition_lock(&self.name)
+      .map(|lock| lock.read().meta.segments.len())
       .unwrap_or(0)
   }
 
   fn disk_space(&self) -> Result<u64> {
-    let st = self.inner.state.read();
     Ok(
-      st.partitions
-        .get(&self.name)
-        .map(|p| p.segments.iter().map(|s| s.bytes).sum::<u64>())
+      self
+        .inner
+        .partition_lock(&self.name)
+        .map(|lock| {
+          lock
+            .read()
+            .meta
+            .segments
+            .iter()
+            .map(|s| s.bytes)
+            .sum::<u64>()
+        })
         .unwrap_or(0),
     )
   }

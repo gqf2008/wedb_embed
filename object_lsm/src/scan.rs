@@ -84,15 +84,18 @@ struct Snap {
 }
 
 fn snapshot(inner: &Arc<Inner>, part: &str, b: &Bounds) -> Snap {
-  let st = inner.state.read();
-  let prefix = st.cfg.prefix.clone();
-  let Some(ps) = st.partitions.get(part) else {
+  let (prefix, lock) = {
+    let st = inner.state.read();
+    (st.cfg.prefix.clone(), st.partition_locks.get(part).cloned())
+  };
+  let Some(lock) = lock else {
     return Snap {
       prefix,
       mem: Vec::new(),
       segments: Vec::new(),
     };
   };
+  let ps = lock.read();
   let mem = ps
     .mem
     .iter()
@@ -106,6 +109,7 @@ fn snapshot(inner: &Arc<Inner>, part: &str, b: &Bounds) -> Snap {
     })
     .collect();
   let segments = ps
+    .meta
     .segments
     .iter()
     .filter(|s| seg_overlaps(s, b))

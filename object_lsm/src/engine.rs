@@ -32,7 +32,7 @@ use crate::{
     BLOCK_HEADER_LEN, BlockMeta, SegmentEntries, SegmentIndex, SegmentMeta, TAIL_LEN,
     build_segment_meta, decode_block, decode_index, encode_segment, find_block, parse_tail,
   },
-  state::{EngineState, MemEntry, PartitionState},
+  state::{EngineState, MemEntry, PartitionLock, PartitionState},
   store::Store,
 };
 
@@ -137,8 +137,14 @@ impl Drop for ObjectLsm {
   }
 }
 
+fn sync_partition_meta(st: &mut EngineState, ps: &PartitionState) {
+  if let Some(pm) = st.partitions.get_mut(&ps.name) {
+    *pm = ps.meta.clone();
+  }
+}
+
 /// Rebuild in-memory state from the durable manifest + journal tail, then run
-/// startup compaction/G C.
+/// startup compaction/GC.
 fn recover(store: &dyn Store, cfg: &Config, index_cache: &IndexCache) -> Result<EngineState> {
   let mut st = EngineState::new(cfg.clone());
   let prefix = &cfg.prefix;
@@ -163,16 +169,16 @@ fn recover(store: &dyn Store, cfg: &Config, index_cache: &IndexCache) -> Result<
           index_cache.insert(seg.id, Arc::new(index.clone()));
         }
       }
-      st.partitions.insert(
+      let meta = pm.clone();
+      st.partitions.insert(name.clone(), pm);
+      st.partition_locks.insert(
         name.clone(),
-        PartitionState {
+        Arc::new(RwLock::new(PartitionState {
           name,
           mem: BTreeMap::new(),
           mem_bytes: 0,
-          segments: pm.segments,
-          watermark: pm.watermark,
-          dropped: pm.dropped,
-        },
+          meta,
+        })),
       );
     }
   }
@@ -205,42 +211,55 @@ fn recover(store: &dyn Store, cfg: &Config, index_cache: &IndexCache) -> Result<
       continue;
     };
     for group in decode_group_stream(&bytes)? {
-      apply_group(&mut st, &group)?;
+      apply_group_recover(&mut st, &group)?;
     }
   }
 
   // Flush replayed memtables that already exceeded the budget.
   let over: Vec<String> = st
-    .partitions
-    .values()
-    .filter(|p| !p.dropped && p.mem_bytes > cfg.max_memtable_bytes)
-    .map(|p| p.name.clone())
+    .partition_locks
+    .iter()
+    .filter_map(|(name, lock)| {
+      let ps = lock.read();
+      (!ps.meta.dropped && ps.mem_bytes > cfg.max_memtable_bytes).then(|| name.clone())
+    })
     .collect();
   for name in over {
-    flush_partition(store, &mut st, &name)?;
+    let lock = st
+      .partition_locks
+      .get(&name)
+      .cloned()
+      .expect("partition present");
+    let mut ps = lock.write();
+    flush_partition(store, &mut st, &mut ps)?;
   }
-  maybe_compact_all(store, &mut st)?;
+  maybe_compact_all_state(store, &mut st)?;
   gc_journal(store, &mut st);
   gc_objects_at_open(store, &mut st)?;
   Ok(st)
 }
 
-/// Apply a committed group to partition memtables, skipping partitions whose
-/// watermark already folded the group into durable segments.
-fn apply_group(st: &mut EngineState, group: &Group) -> Result<()> {
+/// Apply a committed group during recovery. Unlike the online commit path,
+/// this is single-threaded startup state construction.
+fn apply_group_recover(st: &mut EngineState, group: &Group) -> Result<()> {
   for op in &group.ops {
     let wm = st
       .partitions
       .get(&op.part)
-      .map(|p| p.watermark)
+      .map(|pm| pm.watermark)
       .unwrap_or(0);
     if group.seq <= wm {
       continue;
     }
-    let ps = st
-      .partitions
-      .entry(op.part.clone())
-      .or_insert_with(|| PartitionState::new(op.part.clone()));
+    if !st.partition_locks.contains_key(&op.part) {
+      st.insert_partition(op.part.clone());
+    }
+    let lock = st
+      .partition_locks
+      .get(&op.part)
+      .cloned()
+      .expect("partition present");
+    let mut ps = lock.write();
     ps.apply(&op.key, op.value.as_deref());
   }
   Ok(())
@@ -261,15 +280,8 @@ fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
     next_journal_seq: st.journal_seq,
     partitions: BTreeMap::new(),
   };
-  for (name, ps) in &st.partitions {
-    man.partitions.insert(
-      name.clone(),
-      PartitionMeta {
-        segments: ps.segments.clone(),
-        watermark: ps.watermark,
-        dropped: ps.dropped,
-      },
-    );
+  for (name, pm) in &st.partitions {
+    man.partitions.insert(name.clone(), pm.clone());
   }
   st.manifest_seq = man.seq;
   let bytes = man.encode()?;
@@ -279,37 +291,33 @@ fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
 }
 
 /// Flush one partition's memtable into an immutable block-indexed segment and
-/// advance its watermark.
-fn flush_partition(store: &dyn Store, st: &mut EngineState, name: &str) -> Result<()> {
-  {
-    let ps = match st.partitions.get_mut(name) {
-      Some(ps) if !ps.dropped => ps,
-      _ => return Ok(()),
-    };
-    if ps.mem.is_empty() {
-      return Ok(());
-    }
-    let entries: SegmentEntries = ps
-      .mem
-      .iter()
-      .map(|(k, e)| {
-        let v = match e {
-          MemEntry::Value(v) => Some(v.clone()),
-          MemEntry::Tombstone => None,
-        };
-        (k.clone(), v)
-      })
-      .collect();
-    let encoded = encode_segment(&entries, st.cfg.block_size as usize)?;
-    let id = st.next_segment_id;
-    st.next_segment_id += 1;
-    store.put(&segment_key(&st.cfg.prefix, name, id), &encoded)?;
-    let meta = build_segment_meta(id, st.journal_seq, &encoded, &entries)?;
-    ps.segments.push(meta);
-    ps.watermark = st.journal_seq;
-    ps.mem.clear();
-    ps.mem_bytes = 0;
+/// advance its watermark. The caller must hold both the partition write lock
+/// (via `ps`) and the global write lock (via `st`).
+fn flush_partition(store: &dyn Store, st: &mut EngineState, ps: &mut PartitionState) -> Result<()> {
+  if ps.meta.dropped || ps.mem.is_empty() {
+    return Ok(());
   }
+  let entries: SegmentEntries = ps
+    .mem
+    .iter()
+    .map(|(k, e)| {
+      let v = match e {
+        MemEntry::Value(v) => Some(v.clone()),
+        MemEntry::Tombstone => None,
+      };
+      (k.clone(), v)
+    })
+    .collect();
+  let encoded = encode_segment(&entries, st.cfg.block_size as usize)?;
+  let id = st.next_segment_id;
+  st.next_segment_id += 1;
+  store.put(&segment_key(&st.cfg.prefix, &ps.name, id), &encoded)?;
+  let meta = build_segment_meta(id, st.journal_seq, &encoded, &entries)?;
+  ps.meta.segments.push(meta);
+  ps.meta.watermark = st.journal_seq;
+  ps.mem.clear();
+  ps.mem_bytes = 0;
+  sync_partition_meta(st, ps);
   publish_manifest(store, st)
 }
 
@@ -347,32 +355,29 @@ fn read_segment_entries(
   Ok(out)
 }
 
-/// Merge every segment of a partition into one fresh segment: read newest ->
-/// oldest, keep only the surviving values, drop tombstones only after all
-/// older segments have been folded in, publish, then (when eager deletion is
-/// enabled) delete the old objects.
-fn compact_partition_locked(store: &dyn Store, st: &mut EngineState, name: &str) -> Result<bool> {
-  flush_partition(store, st, name)?;
+/// Merge every segment of a partition into one fresh segment. The caller must
+/// hold both the partition write lock and the global write lock.
+fn compact_partition_locked(
+  store: &dyn Store,
+  st: &mut EngineState,
+  ps: &mut PartitionState,
+) -> Result<bool> {
+  flush_partition(store, st, ps)?;
   let prefix = st.cfg.prefix.clone();
   let eager = st.cfg.eager_object_delete;
-  let need = {
-    let ps = st.partitions.get(name);
-    matches!(ps, Some(p) if !p.dropped && p.segments.len() > 1)
-  };
-  if !need {
+  if !(!ps.meta.dropped && ps.meta.segments.len() > 1) {
     return Ok(false);
   }
+
   // 1. fold all segments newest -> oldest into a single decision map.
   let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-  {
-    let ps = st.partitions.get(name).expect("partition present");
-    for seg in ps.segments.iter().rev() {
-      let entries = read_segment_entries(store, &prefix, name, seg)?;
-      for (k, v) in entries {
-        map.entry(k).or_insert(v);
-      }
+  for seg in ps.meta.segments.iter().rev() {
+    let entries = read_segment_entries(store, &prefix, &ps.name, seg)?;
+    for (k, v) in entries {
+      map.entry(k).or_insert(v);
     }
   }
+
   // 2. drop tombstones: nothing older than the merged run survives.
   let mut out: SegmentEntries = Vec::with_capacity(map.len());
   for (k, v) in map {
@@ -380,22 +385,23 @@ fn compact_partition_locked(store: &dyn Store, st: &mut EngineState, name: &str)
       out.push((k, Some(val)));
     }
   }
+
   // 3. write the merged result (or none), publish, then delete the old run.
-  let ps = st.partitions.get_mut(name).expect("partition present");
-  let old = std::mem::take(&mut ps.segments);
+  let old = std::mem::take(&mut ps.meta.segments);
   if !out.is_empty() {
     let encoded = encode_segment(&out, st.cfg.block_size as usize)?;
     let id = st.next_segment_id;
     st.next_segment_id += 1;
-    store.put(&segment_key(&prefix, name, id), &encoded)?;
+    store.put(&segment_key(&prefix, &ps.name, id), &encoded)?;
     let meta = build_segment_meta(id, st.journal_seq, &encoded, &out)?;
-    ps.segments.push(meta);
+    ps.meta.segments.push(meta);
   }
-  ps.watermark = st.journal_seq;
+  ps.meta.watermark = st.journal_seq;
+  sync_partition_meta(st, ps);
   publish_manifest(store, st)?;
   if eager {
     for seg in &old {
-      let _ = store.delete(&segment_key(&prefix, name, seg.id));
+      let _ = store.delete(&segment_key(&prefix, &ps.name, seg.id));
     }
   }
   st.compactions_completed += 1;
@@ -403,15 +409,19 @@ fn compact_partition_locked(store: &dyn Store, st: &mut EngineState, name: &str)
 }
 
 /// Compact every partition that reached the configured segment limit.
-fn maybe_compact_all(store: &dyn Store, st: &mut EngineState) -> Result<()> {
-  let names: Vec<String> = st
-    .partitions
-    .values()
-    .filter(|p| !p.dropped && p.segments.len() >= st.cfg.max_segments_before_compact)
-    .map(|p| p.name.clone())
-    .collect();
+fn maybe_compact_all_state(store: &dyn Store, st: &mut EngineState) -> Result<()> {
+  let limit = st.cfg.max_segments_before_compact;
+  let names: Vec<String> = st.partition_locks.keys().cloned().collect();
   for name in names {
-    compact_partition_locked(store, st, &name)?;
+    let lock = st
+      .partition_locks
+      .get(&name)
+      .cloned()
+      .expect("partition present");
+    let mut ps = lock.write();
+    if !ps.meta.dropped && ps.meta.segments.len() >= limit {
+      compact_partition_locked(store, st, &mut ps)?;
+    }
   }
   Ok(())
 }
@@ -422,7 +432,7 @@ fn gc_journal(store: &dyn Store, st: &mut EngineState) {
   let min_wm = st
     .partitions
     .values()
-    .map(|p| p.watermark)
+    .map(|pm| pm.watermark)
     .min()
     .unwrap_or(0);
   if min_wm == 0 {
@@ -447,8 +457,8 @@ fn gc_objects_at_open(store: &dyn Store, st: &mut EngineState) -> Result<()> {
     let live: BTreeMap<String, Vec<u64>> = st
       .partitions
       .iter()
-      .filter(|(_, p)| !p.dropped)
-      .map(|(name, p)| (name.clone(), p.segments.iter().map(|s| s.id).collect()))
+      .filter(|(_, pm)| !pm.dropped)
+      .map(|(name, pm)| (name.clone(), pm.segments.iter().map(|s| s.id).collect()))
       .collect();
     for key in store.list(&seg_root)? {
       let rest = match key.strip_prefix(&seg_prefix) {
@@ -521,66 +531,136 @@ fn spawn_journal_flusher(inner: Arc<Inner>) {
 }
 
 impl Inner {
+  pub(crate) fn partition_lock(&self, name: &str) -> Option<PartitionLock> {
+    self.state.read().partition_locks.get(name).cloned()
+  }
+
+  fn ensure_partitions(&self, names: &[String]) {
+    let mut st = self.state.write();
+    for name in names {
+      if !st.partition_locks.contains_key(name) {
+        st.insert_partition(name.clone());
+      } else if !st.partitions.contains_key(name) {
+        st.partitions.insert(name.clone(), PartitionMeta::default());
+      }
+    }
+  }
+
+  fn partition_locks(&self, names: &[String]) -> BTreeMap<String, PartitionLock> {
+    let st = self.state.read();
+    names
+      .iter()
+      .filter_map(|name| {
+        st.partition_locks
+          .get(name)
+          .cloned()
+          .map(|lock| (name.clone(), lock))
+      })
+      .collect()
+  }
+
   /// Atomically commit an op group (journal PUT first, then apply).
+  ///
+  /// Locks for every involved partition are acquired in sorted-name order,
+  /// then the global metadata lock is taken only for seq allocation / journal
+  /// buffering / flush-compact-GC. Different partitions therefore commit
+  /// concurrently and only briefly share the global lock.
   pub(crate) fn commit_ops(&self, ops: Vec<Op>) -> Result<()> {
     if ops.is_empty() {
       return Ok(());
     }
-    let mut st = self.state.write();
-    let seq = st.journal_seq + 1;
-    st.journal_seq = seq;
-    let group = Group { seq, ops };
-    let bytes = encode_group(&group)?;
-    // Buffer the encoded group. Strict mode (no window) flushes it as its own
-    // durable object before applying, preserving per-commit durability.
-    // Windowed mode batches queued groups into one object on a timer.
-    if st.pending.is_empty() {
-      st.pending_lo = seq;
+    let mut names: Vec<String> = ops.iter().map(|op| op.part.clone()).collect();
+    names.sort();
+    names.dedup();
+
+    self.ensure_partitions(&names);
+    let locks = self.partition_locks(&names);
+    let mut guards = BTreeMap::new();
+    for name in &names {
+      guards.insert(
+        name.clone(),
+        locks.get(name).expect("partition lock").write(),
+      );
     }
-    st.pending.extend_from_slice(&bytes);
-    if st.cfg.journal_window_ms.is_none()
-      || st.pending.len() as u64 >= st.cfg.journal_max_buffer_bytes
+
+    let group = {
+      let mut st = self.state.write();
+      let seq = st.journal_seq + 1;
+      st.journal_seq = seq;
+      let group = Group { seq, ops };
+      let bytes = encode_group(&group)?;
+      if st.pending.is_empty() {
+        st.pending_lo = seq;
+      }
+      st.pending.extend_from_slice(&bytes);
+      if st.cfg.journal_window_ms.is_none()
+        || st.pending.len() as u64 >= st.cfg.journal_max_buffer_bytes
+      {
+        flush_journal_pending(&*self.store, &mut st)?;
+      }
+      group
+    };
+
+    for op in &group.ops {
+      let ps = guards.get_mut(&op.part).expect("partition guard");
+      if group.seq <= ps.meta.watermark {
+        continue;
+      }
+      ps.apply(&op.key, op.value.as_deref());
+    }
+
     {
-      flush_journal_pending(&*self.store, &mut st)?;
+      let mut st = self.state.write();
+      let mem_limit = st.cfg.max_memtable_bytes;
+      let over: Vec<String> = names
+        .iter()
+        .filter(|name| {
+          guards
+            .get(*name)
+            .map(|ps| !ps.meta.dropped && ps.mem_bytes > mem_limit)
+            .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+      for name in over {
+        flush_partition(&*self.store, &mut st, guards.get_mut(&name).expect("guard"))?;
+      }
+
+      let seg_limit = st.cfg.max_segments_before_compact;
+      for name in &names {
+        let ps = guards.get_mut(name).expect("guard");
+        if !ps.meta.dropped && ps.meta.segments.len() >= seg_limit {
+          compact_partition_locked(&*self.store, &mut st, ps)?;
+        }
+      }
+      gc_journal(&*self.store, &mut st);
     }
-    apply_group(&mut st, &group)?;
-    let over: Vec<String> = st
-      .partitions
-      .values()
-      .filter(|p| !p.dropped && p.mem_bytes > st.cfg.max_memtable_bytes)
-      .map(|p| p.name.clone())
-      .collect();
-    for name in over {
-      flush_partition(&*self.store, &mut st, &name)?;
-    }
-    maybe_compact_all(&*self.store, &mut st)?;
-    gc_journal(&*self.store, &mut st);
     Ok(())
   }
 
   /// Ensure a partition exists and is not marked dropped (re-create clears the
   /// dropped flag, keeping its watermark to avoid stale journal replays).
   pub(crate) fn touch_partition(&self, name: &str) -> Result<()> {
-    let mut st = self.state.write();
-    let need_publish = match st.partitions.get_mut(name) {
-      Some(ps) => {
-        if ps.dropped {
-          ps.dropped = false;
-          true
-        } else {
-          false
+    let existing = self.partition_lock(name);
+    match existing {
+      Some(lock) => {
+        let mut ps = lock.write();
+        if ps.meta.dropped {
+          ps.meta.dropped = false;
+          let mut st = self.state.write();
+          sync_partition_meta(&mut st, &ps);
+          publish_manifest(&*self.store, &mut st)?;
         }
+        Ok(())
       }
       None => {
-        st.partitions
-          .insert(name.to_string(), PartitionState::new(name));
-        false
+        let mut st = self.state.write();
+        if !st.partition_locks.contains_key(name) {
+          st.insert_partition(name.to_string());
+        }
+        Ok(())
       }
-    };
-    if need_publish {
-      publish_manifest(&*self.store, &mut st)?;
     }
-    Ok(())
   }
 
   /// Load (and cache) the block index of a segment via tail + index Range GETs.
@@ -651,18 +731,25 @@ impl Inner {
   /// Point lookup: memtable, then segments newest -> oldest using the block
   /// index to fetch only the candidate block.
   pub(crate) fn lookup(&self, name: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    let st = self.state.read();
-    let prefix = st.cfg.prefix.clone();
-    let Some(ps) = st.partitions.get(name) else {
+    let (prefix, lock) = {
+      let st = self.state.read();
+      (st.cfg.prefix.clone(), st.partition_locks.get(name).cloned())
+    };
+    let Some(lock) = lock else {
       return Ok(None);
     };
-    if let Some(e) = ps.mem.get(key) {
-      return Ok(match e {
-        MemEntry::Value(v) => Some(v.clone()),
-        MemEntry::Tombstone => None,
-      });
-    }
-    for seg in ps.segments.iter().rev() {
+    let segments = {
+      let ps = lock.read();
+      if let Some(e) = ps.mem.get(key) {
+        return Ok(match e {
+          MemEntry::Value(v) => Some(v.clone()),
+          MemEntry::Tombstone => None,
+        });
+      }
+      ps.meta.segments.clone()
+    };
+
+    for seg in segments.iter().rev() {
       if seg.first.as_slice() > key || seg.last.as_slice() < key {
         continue;
       }
@@ -684,52 +771,50 @@ impl Inner {
   }
 
   pub(crate) fn clear_partition(&self, name: &str) -> Result<()> {
+    let Some(lock) = self.partition_lock(name) else {
+      return Ok(());
+    };
+    let mut ps = lock.write();
     let mut st = self.state.write();
     let prefix = st.cfg.prefix.clone();
     let eager = st.cfg.eager_object_delete;
     let tail_seq = st.journal_seq;
-    {
-      let ps = match st.partitions.get_mut(name) {
-        Some(ps) => ps,
-        None => return Ok(()),
-      };
-      for seg in ps.segments.drain(..) {
-        if eager {
-          let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
-        }
-        self.index_cache.remove(seg.id);
+    for seg in ps.meta.segments.drain(..) {
+      if eager {
+        let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
       }
-      ps.mem.clear();
-      ps.mem_bytes = 0;
-      ps.watermark = tail_seq;
-      ps.dropped = false;
+      self.index_cache.remove(seg.id);
     }
+    ps.mem.clear();
+    ps.mem_bytes = 0;
+    ps.meta.watermark = tail_seq;
+    ps.meta.dropped = false;
+    sync_partition_meta(&mut st, &ps);
     publish_manifest(&*self.store, &mut st)?;
     gc_journal(&*self.store, &mut st);
     Ok(())
   }
 
   pub(crate) fn rm_partition(&self, name: &str) -> Result<()> {
+    let Some(lock) = self.partition_lock(name) else {
+      return Ok(());
+    };
+    let mut ps = lock.write();
     let mut st = self.state.write();
     let prefix = st.cfg.prefix.clone();
     let eager = st.cfg.eager_object_delete;
     let tail_seq = st.journal_seq;
-    {
-      let ps = match st.partitions.get_mut(name) {
-        Some(ps) => ps,
-        None => return Ok(()),
-      };
-      for seg in ps.segments.drain(..) {
-        if eager {
-          let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
-        }
-        self.index_cache.remove(seg.id);
+    for seg in ps.meta.segments.drain(..) {
+      if eager {
+        let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
       }
-      ps.mem.clear();
-      ps.mem_bytes = 0;
-      ps.watermark = tail_seq;
-      ps.dropped = true;
+      self.index_cache.remove(seg.id);
     }
+    ps.mem.clear();
+    ps.mem_bytes = 0;
+    ps.meta.watermark = tail_seq;
+    ps.meta.dropped = true;
+    sync_partition_meta(&mut st, &ps);
     publish_manifest(&*self.store, &mut st)?;
     gc_journal(&*self.store, &mut st);
     Ok(())
@@ -737,25 +822,30 @@ impl Inner {
 
   /// Flush + merge-compact a single partition.
   pub(crate) fn compact_partition(&self, name: &str) -> Result<()> {
+    let Some(lock) = self.partition_lock(name) else {
+      return Ok(());
+    };
+    let mut ps = lock.write();
     let mut st = self.state.write();
-    compact_partition_locked(&*self.store, &mut st, name)?;
+    compact_partition_locked(&*self.store, &mut st, &mut ps)?;
     gc_journal(&*self.store, &mut st);
     Ok(())
   }
 
   /// Flush + merge-compact every non-dropped partition.
   pub(crate) fn compact_all(&self) -> Result<()> {
-    let mut st = self.state.write();
-    let names: Vec<String> = st
-      .partitions
-      .values()
-      .filter(|p| !p.dropped && (!p.mem.is_empty() || p.segments.len() > 1))
-      .map(|p| p.name.clone())
-      .collect();
+    let names: Vec<String> = self.state.read().partition_locks.keys().cloned().collect();
     for name in names {
-      compact_partition_locked(&*self.store, &mut st, &name)?;
+      let Some(lock) = self.partition_lock(&name) else {
+        continue;
+      };
+      let mut ps = lock.write();
+      let mut st = self.state.write();
+      if !ps.meta.dropped && (!ps.mem.is_empty() || ps.meta.segments.len() > 1) {
+        compact_partition_locked(&*self.store, &mut st, &mut ps)?;
+      }
+      gc_journal(&*self.store, &mut st);
     }
-    gc_journal(&*self.store, &mut st);
     Ok(())
   }
 }
@@ -780,7 +870,7 @@ impl Engine for ObjectLsm {
       .read()
       .partitions
       .get(name)
-      .map(|p| !p.dropped)
+      .map(|pm| !pm.dropped)
       .unwrap_or(false)
   }
 
@@ -792,8 +882,8 @@ impl Engine for ObjectLsm {
         .read()
         .partitions
         .iter()
-        .filter(|(_, p)| !p.dropped)
-        .map(|(n, _)| n.clone())
+        .filter(|(_, pm)| !pm.dropped)
+        .map(|(name, _)| name.clone())
         .collect(),
     )
   }
@@ -803,14 +893,15 @@ impl Engine for ObjectLsm {
   }
 
   fn write_buffer_size(&self) -> u64 {
-    self
+    let locks: Vec<PartitionLock> = self
       .inner
       .state
       .read()
-      .partitions
+      .partition_locks
       .values()
-      .map(|p| p.mem_bytes)
-      .sum()
+      .cloned()
+      .collect();
+    locks.iter().map(|lock| lock.read().mem_bytes).sum()
   }
 
   fn cache_size(&self) -> u64 {
@@ -846,11 +937,21 @@ impl Engine for ObjectLsm {
   }
 
   fn disk_space(&self) -> Result<u64> {
-    let st = self.inner.state.read();
+    let locks: Vec<PartitionLock> = self
+      .inner
+      .state
+      .read()
+      .partition_locks
+      .values()
+      .cloned()
+      .collect();
     Ok(
-      st.partitions
-        .values()
-        .map(|p| p.segments.iter().map(|s| s.bytes).sum::<u64>() + p.mem_bytes)
+      locks
+        .iter()
+        .map(|lock| {
+          let ps = lock.read();
+          ps.meta.segments.iter().map(|s| s.bytes).sum::<u64>() + ps.mem_bytes
+        })
         .sum(),
     )
   }
