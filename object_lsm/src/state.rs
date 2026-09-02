@@ -76,8 +76,12 @@ pub struct EngineState {
   /// Last manifest seq written (0 = none).
   pub manifest_seq: u64,
   pub next_segment_id: u64,
-  /// Journal group seqs whose objects still exist (maintained for GC).
+  /// Journal object end-seqs whose objects still exist (maintained for GC).
   pub journal_seqs: BTreeSet<u64>,
+  /// Encoded groups waiting for group-commit flush (windowed mode).
+  pub pending: Vec<u8>,
+  /// First seq present in `pending` (0 when empty).
+  pub pending_lo: u64,
   /// Completed merge compactions (metrics).
   pub compactions_completed: u64,
 }
@@ -92,6 +96,8 @@ impl EngineState {
       next_segment_id: 0,
       journal_seqs: BTreeSet::new(),
       compactions_completed: 0,
+      pending: Vec::new(),
+      pending_lo: 0,
     }
   }
 }

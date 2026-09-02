@@ -35,6 +35,27 @@ fn n_default() -> usize {
     .unwrap_or(200)
 }
 
+/// Optional group-commit window from `OBJLSM_WINDOW_MS` (None = strict).
+fn window_ms() -> Option<u64> {
+  std::env::var("OBJLSM_WINDOW_MS")
+    .ok()
+    .and_then(|s| s.parse().ok())
+}
+
+fn label(name: &str) -> String {
+  match window_ms() {
+    Some(ms) => format!("{name} (grouped {ms}ms)"),
+    None => name.to_string(),
+  }
+}
+
+fn mk_cfg(prefix: &str) -> Config {
+  Config::new(prefix)
+    .max_memtable_bytes(1 << 20)
+    .block_size(4096)
+    .journal_window_ms(window_ms())
+}
+
 fn key(i: usize) -> Vec<u8> {
   format!("bench-key-{i:08}").into_bytes()
 }
@@ -93,23 +114,17 @@ fn main() {
 
   // objectlsm over in-memory store
   let store = MemoryStore::new();
-  let cfg = Config::new("bench/remote/mem")
-    .max_memtable_bytes(1 << 20)
-    .block_size(4096);
-  let mem = ObjectLsm::open(Arc::new(store), cfg).expect("obj mem open");
-  bench_engine("objectlsm (memory)", &mem, n);
+  let mem = ObjectLsm::open(Arc::new(store), mk_cfg("bench/remote/mem")).expect("obj mem open");
+  bench_engine(&label("objectlsm (memory)"), &mem, n);
 
   // objectlsm over Cloudflare R2
   if !env_ok() {
     println!("R2 env not configured; skipping R2 backend benches");
     return;
   }
-  let r2cfg = Config::new("wedb_bench/remote")
-    .max_memtable_bytes(1 << 20)
-    .block_size(4096);
   let r2store = Arc::new(R2Store::from_env().expect("r2 store"));
-  let r2 = ObjectLsm::open(r2store.clone(), r2cfg).expect("obj r2 open");
-  bench_engine("objectlsm (R2)", &r2, n);
+  let r2 = ObjectLsm::open(r2store.clone(), mk_cfg("wedb_bench/remote")).expect("obj r2 open");
+  bench_engine(&label("objectlsm (R2)"), &r2, n);
 
   // cleanup R2 prefix (best effort)
   for key in r2store.list("wedb_bench/remote").expect("list") {

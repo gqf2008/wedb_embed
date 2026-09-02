@@ -81,18 +81,24 @@ cargo bench -p wedb_object_lsm --features "r2 wedb" --bench bench_remote
 # BENCH_N overrides the key count (default 200)
 ```
 
-Observed (Cloudflare R2 public internet from CN, n=120, per-op):
+Observed (Cloudflare R2 public internet from CN):
 
 | backend | insert (commit) | point read (warm) | scan (warm) |
 | --- | --- | --- | --- |
 | fjall (local disk) | ~1 µs | ~0.3 µs | ~0.3 µs |
 | objectlsm (memory) | ~1 µs | ~0.5 µs | ~0.2 µs |
-| objectlsm (R2) | ~0.3 s (per-commit PUT) | ~9 ms (Range GET) | µs (block-cache warm) |
+| objectlsm (R2, strict) | ~0.30 s /op (per-commit PUT) | ~9–19 ms (Range GET) | µs (cache warm) |
+| objectlsm (R2, grouped 25 ms) | ~µs ack + flush | ~12 ms (Range GET) | µs (cache warm) |
 
-The R2 write cost is dominated by the per-commit journal object PUT. The next
-engineering lever is group-commit journal batching (amortize many commits into
-one PUT) plus larger segments, which is where ObjectLsm's S3 story gets its
-throughput back on real object stores.
+Group-commit (`Config::journal_window_ms(Some(ms))`) turns queued commits into
+one journal object per window. For 40 durable commits the measured wall time
+dropped from ~11.8 s (strict, 40 PUTs) + ~9.2 s GC deletes to ~1.8 s total
+(strict mode totals ~21 s). Ack in grouped mode means "buffered"; durability
+is reached at the next flush (`persist()` forces one, so call it before
+shutdown or whenever you need a sync point), matching an AOF-every-N-ms
+trade-off. Warm cached reads/scans stay µs-level on R2.
+
+Run: `OBJLSM_WINDOW_MS=25 BENCH_N=200 cargo bench -p wedb_object_lsm --features "r2 wedb" --bench bench_remote`
 
 ## Multi-instance shared bucket: lease + sharding
 
@@ -117,3 +123,4 @@ ObjectLsm::open_leased(store.clone(), cfg1, lease("w1"))?;
 Notes: leases are cooperative (best-effort fencing); each shard is a separate
 engine instance — cross-shard queries/cluster routing stay an application
 concern (as in Redis Cluster).
+

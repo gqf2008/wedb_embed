@@ -2,7 +2,15 @@
 //! merge compaction, garbage collection, manifest publishing and the
 //! [`Engine`] trait impl.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+  collections::BTreeMap,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
+  thread,
+  time::Duration,
+};
 
 use parking_lot::RwLock;
 use wedb_embed_engine::Engine;
@@ -12,7 +20,7 @@ use crate::{
   cache::{BlockCache, IndexCache},
   config::Config,
   error::{Error, Result},
-  journal::{Group, Op, decode_group, encode_group},
+  journal::{Group, Op, decode_group_stream, encode_group},
   keys::{
     current_key, journal_key, journal_prefix, manifest_key, manifest_prefix, parse_tail_seq,
     segment_key, segment_root,
@@ -34,6 +42,8 @@ pub struct Inner {
   pub state: RwLock<EngineState>,
   pub block_cache: BlockCache,
   pub index_cache: IndexCache,
+  /// Stops the background group-commit journal flusher thread.
+  pub journal_stop: AtomicBool,
 }
 
 /// Object-storage-backed LSM engine implementing the wedb_embed_engine traits.
@@ -98,20 +108,23 @@ impl ObjectLsm {
     let state = recover(&*store, &cfg)?;
     let block_cache = BlockCache::new(cfg.cache_capacity);
     let index_cache = IndexCache::default();
-    Ok(Self {
-      inner: Arc::new(Inner {
-        store,
-        state: RwLock::new(state),
-        block_cache,
-        index_cache,
-      }),
-      lease: None,
-    })
+    let inner = Arc::new(Inner {
+      store,
+      state: RwLock::new(state),
+      block_cache,
+      index_cache,
+      journal_stop: AtomicBool::new(false),
+    });
+    if cfg.journal_window_ms.is_some() {
+      spawn_journal_flusher(inner.clone());
+    }
+    Ok(Self { inner, lease: None })
   }
 }
 
 impl Drop for ObjectLsm {
   fn drop(&mut self) {
+    self.inner.journal_stop.store(true, Ordering::SeqCst);
     if let Some(lease) = self.lease.take() {
       drop(lease);
     }
@@ -169,8 +182,9 @@ fn recover(store: &dyn Store, cfg: &Config) -> Result<EngineState> {
     let Some(bytes) = store.get(&journal_key(prefix, s))? else {
       continue;
     };
-    let group = decode_group(&bytes)?;
-    apply_group(&mut st, &group)?;
+    for group in decode_group_stream(&bytes)? {
+      apply_group(&mut st, &group)?;
+    }
   }
 
   // Flush replayed memtables that already exceeded the budget.
@@ -213,6 +227,12 @@ fn apply_group(st: &mut EngineState, group: &Group) -> Result<()> {
 /// Publish a new manifest snapshot: write `manifest/<seq+1>` then flip
 /// `manifest/current` (the single atomic visibility point).
 fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
+  // In windowed (group-commit) mode make every pending group durable before
+  // publishing a manifest whose watermarks may fold those groups into
+  // segments or drops.
+  if st.cfg.journal_window_ms.is_some() && !st.pending.is_empty() {
+    flush_journal_pending(store, st)?;
+  }
   let mut man = Manifest {
     seq: st.manifest_seq + 1,
     next_segment_id: st.next_segment_id,
@@ -428,6 +448,48 @@ fn gc_objects_at_open(store: &dyn Store, st: &mut EngineState) -> Result<()> {
   Ok(())
 }
 
+/// Flush the pending group-commit buffer into one journal object covering
+/// groups `pending_lo..=journal_seq`.
+fn flush_journal_pending(store: &dyn Store, st: &mut EngineState) -> Result<()> {
+  if st.pending.is_empty() {
+    return Ok(());
+  }
+  let end = st.journal_seq;
+  store.put(&journal_key(&st.cfg.prefix, end), &st.pending)?;
+  st.journal_seqs.insert(end);
+  st.pending.clear();
+  st.pending_lo = 0;
+  Ok(())
+}
+
+/// Background flusher for windowed group-commit mode: every `ms` it turns the
+/// pending buffer into one journal object (and garbage-collects folded ones).
+fn spawn_journal_flusher(inner: Arc<Inner>) {
+  let Some(ms) = inner.state.read().cfg.journal_window_ms else {
+    return;
+  };
+  thread::Builder::new()
+    .name("objectlsm-journal".into())
+    .spawn(move || {
+      loop {
+        if inner.journal_stop.load(Ordering::SeqCst) {
+          return;
+        }
+        thread::sleep(Duration::from_millis(ms));
+        if inner.journal_stop.load(Ordering::SeqCst) {
+          return;
+        }
+        {
+          let mut st = inner.state.write();
+          if !st.pending.is_empty() && flush_journal_pending(&*inner.store, &mut st).is_ok() {
+            gc_journal(&*inner.store, &mut st);
+          }
+        }
+      }
+    })
+    .ok();
+}
+
 impl Inner {
   /// Atomically commit an op group (journal PUT first, then apply).
   pub(crate) fn commit_ops(&self, ops: Vec<Op>) -> Result<()> {
@@ -439,8 +501,18 @@ impl Inner {
     st.journal_seq = seq;
     let group = Group { seq, ops };
     let bytes = encode_group(&group)?;
-    self.store.put(&journal_key(&st.cfg.prefix, seq), &bytes)?;
-    st.journal_seqs.insert(seq);
+    // Buffer the encoded group. Strict mode (no window) flushes it as its own
+    // durable object before applying, preserving per-commit durability.
+    // Windowed mode batches queued groups into one object on a timer.
+    if st.pending.is_empty() {
+      st.pending_lo = seq;
+    }
+    st.pending.extend_from_slice(&bytes);
+    if st.cfg.journal_window_ms.is_none()
+      || st.pending.len() as u64 >= st.cfg.journal_max_buffer_bytes
+    {
+      flush_journal_pending(&*self.store, &mut st)?;
+    }
     apply_group(&mut st, &group)?;
     let over: Vec<String> = st
       .partitions
@@ -799,8 +871,14 @@ impl Engine for ObjectLsm {
   }
 
   fn persist(&self) -> Result<()> {
-    // Every committed group is already a durable journal object, so persist()
-    // is a no-op consistency point.
+    // Strict mode: every committed group is already a durable journal object.
+    // Windowed mode: force a synchronous flush so this call only returns once
+    // everything acknowledged so far is durable.
+    if self.inner.state.read().cfg.journal_window_ms.is_some() {
+      let mut st = self.inner.state.write();
+      flush_journal_pending(&*self.inner.store, &mut st)?;
+      gc_journal(&*self.inner.store, &mut st);
+    }
     Ok(())
   }
 

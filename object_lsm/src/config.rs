@@ -25,6 +25,15 @@ pub struct Config {
   pub cache_capacity: u64,
   /// Merge-compact a partition once it holds this many segments.
   pub max_segments_before_compact: usize,
+  /// Group-commit journal window in ms. `None` keeps the strict per-commit
+  /// durable PUT; `Some(ms)` batches concurrent/queued commits into one
+  /// journal object flushed every `ms` (or when the buffer fills), which cuts
+  /// object-store write amplification dramatically. Acknowledged commits in
+  /// this mode are durable after the next flush (`persist()` forces one).
+  pub journal_window_ms: Option<u64>,
+  /// Upper bound of the in-memory pending journal buffer (bytes) before a
+  /// synchronous flush is forced.
+  pub journal_max_buffer_bytes: u64,
 }
 
 impl Default for Config {
@@ -35,6 +44,8 @@ impl Default for Config {
       block_size: DEFAULT_BLOCK_SIZE,
       cache_capacity: DEFAULT_CACHE_CAPACITY,
       max_segments_before_compact: DEFAULT_MAX_SEGMENTS_BEFORE_COMPACT,
+      journal_window_ms: None,
+      journal_max_buffer_bytes: 1024 * 1024,
     }
   }
 }
@@ -69,6 +80,18 @@ impl Config {
   /// Set the segment count that triggers automatic merge compaction.
   pub fn max_segments_before_compact(mut self, n: usize) -> Self {
     self.max_segments_before_compact = n;
+    self
+  }
+
+  /// Set the group-commit journal window (None = strict per-commit PUT).
+  pub fn journal_window_ms(mut self, ms: Option<u64>) -> Self {
+    self.journal_window_ms = ms;
+    self
+  }
+
+  /// Upper bound of the pending journal buffer before a synchronous flush.
+  pub fn journal_max_buffer_bytes(mut self, bytes: u64) -> Self {
+    self.journal_max_buffer_bytes = bytes;
     self
   }
 

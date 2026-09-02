@@ -72,8 +72,8 @@ pub fn encode_group(g: &Group) -> Result<Vec<u8>> {
   Ok(out)
 }
 
-pub fn decode_group(buf: &[u8]) -> Result<Group> {
-  let mut r = Reader::new(buf);
+/// Read one group from the front of `r` (used by single & stream decoding).
+fn read_group(r: &mut Reader<'_>) -> Result<Group> {
   let magic = r.u32()?;
   if magic != GROUP_MAGIC {
     return Err(Error::Corrupt(format!("bad journal magic {magic:#x}")));
@@ -92,8 +92,25 @@ pub fn decode_group(buf: &[u8]) -> Result<Group> {
     };
     ops.push(Op { part, key, value });
   }
+  Ok(Group { seq, ops })
+}
+
+pub fn decode_group(buf: &[u8]) -> Result<Group> {
+  let mut r = Reader::new(buf);
+  let group = read_group(&mut r)?;
   if r.remaining() != 0 {
     return Err(Error::Corrupt("trailing bytes after journal group".into()));
   }
-  Ok(Group { seq, ops })
+  Ok(group)
+}
+
+/// Decode a journal object that may contain several concatenated groups
+/// (group-commit batching) into its individual groups, in order.
+pub fn decode_group_stream(buf: &[u8]) -> Result<Vec<Group>> {
+  let mut r = Reader::new(buf);
+  let mut out = Vec::new();
+  while r.remaining() > 0 {
+    out.push(read_group(&mut r)?);
+  }
+  Ok(out)
 }
