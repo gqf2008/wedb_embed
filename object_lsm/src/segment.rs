@@ -256,6 +256,7 @@ pub fn build_segment_meta(
   seq: u64,
   encoded: &[u8],
   entries: &SegmentEntries,
+  embed_index: bool,
 ) -> Result<SegmentMeta> {
   if encoded.len() < TAIL_LEN {
     return Err(Error::Corrupt(
@@ -280,7 +281,7 @@ pub fn build_segment_meta(
     tombstones,
     bytes: encoded.len() as u64,
     blocks,
-    index: Some(index),
+    index: embed_index.then_some(index),
   })
 }
 
@@ -319,7 +320,7 @@ mod tests {
       all.extend(decode_block(raw).unwrap());
     }
     assert_eq!(all, entries);
-    let meta = build_segment_meta(7, 3, &encoded, &entries).unwrap();
+    let meta = build_segment_meta(7, 3, &encoded, &entries, true).unwrap();
     assert_eq!(meta.count, entries.len() as u64);
     assert_eq!(meta.blocks, idx.blocks.len() as u64);
     assert_eq!(meta.first, b"gone".to_vec());

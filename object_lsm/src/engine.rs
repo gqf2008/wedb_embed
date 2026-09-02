@@ -327,7 +327,13 @@ fn flush_partition(store: &dyn Store, st: &mut EngineState, ps: &mut PartitionSt
   let id = st.next_segment_id;
   st.next_segment_id += 1;
   store.put(&segment_key(&st.cfg.prefix, &ps.name, id), &encoded)?;
-  let meta = build_segment_meta(id, st.journal_seq, &encoded, &entries)?;
+  let meta = build_segment_meta(
+    id,
+    st.journal_seq,
+    &encoded,
+    &entries,
+    st.cfg.manifest_embed_index,
+  )?;
   ps.meta.segments.push(meta);
   ps.meta.watermark = st.journal_seq;
   ps.mem.clear();
@@ -410,7 +416,13 @@ fn compact_partition_locked(
     let id = st.next_segment_id;
     st.next_segment_id += 1;
     store.put(&segment_key(&prefix, &ps.name, id), &encoded)?;
-    Some(build_segment_meta(id, st.journal_seq, &encoded, &out)?)
+    Some(build_segment_meta(
+      id,
+      st.journal_seq,
+      &encoded,
+      &out,
+      st.cfg.manifest_embed_index,
+    )?)
   };
 
   let new_segments = new_meta.map(|m| vec![m]).unwrap_or_default();

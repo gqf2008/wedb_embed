@@ -49,6 +49,11 @@ impl R2Config {
 }
 
 /// Sync [`Store`] backed by Cloudflare R2.
+///
+/// The async `object_store` client is bridged with an internal tokio runtime
+/// via `Runtime::block_on`, so `R2Store` methods must be called from a plain
+/// (non-async) thread. Calling them from inside a tokio async context will
+/// panic.
 pub struct R2Store {
   inner: Arc<dyn ObjectStore>,
   rt: Runtime,
@@ -106,10 +111,11 @@ impl Store for R2Store {
 
   fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
     let p = path(key)?;
-    let range = Range {
-      start: offset as usize,
-      end: offset.saturating_add(len) as usize,
-    };
+    let start =
+      usize::try_from(offset).map_err(|_| Error::store("range offset exceeds platform usize"))?;
+    let end = usize::try_from(offset.saturating_add(len))
+      .map_err(|_| Error::store("range end exceeds platform usize"))?;
+    let range = Range { start, end };
     let inner = self.inner.clone();
     self.block(async move {
       match inner.get_range(&p, range).await {

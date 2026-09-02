@@ -34,6 +34,10 @@ pub struct Config {
   /// Upper bound of the in-memory pending journal buffer (bytes) before a
   /// synchronous flush is forced.
   pub journal_max_buffer_bytes: u64,
+  /// Embed each segment's block index in the manifest. `true` (default) makes
+  /// a cold point read a single block Range GET; `false` shrinks the manifest
+  /// at the cost of tail+index Range GETs on cold reads.
+  pub manifest_embed_index: bool,
   /// When `true` (default), replaced segment objects are deleted eagerly after
   /// compaction, `clear_partition`, `rm_partition`, and startup GC. When
   /// `false`, orphaned segment objects are intentionally left behind so an
@@ -54,6 +58,7 @@ impl Default for Config {
       journal_window_ms: None,
       journal_max_buffer_bytes: 1024 * 1024,
       eager_object_delete: true,
+      manifest_embed_index: true,
     }
   }
 }
@@ -100,6 +105,12 @@ impl Config {
   /// Upper bound of the pending journal buffer before a synchronous flush.
   pub fn journal_max_buffer_bytes(mut self, bytes: u64) -> Self {
     self.journal_max_buffer_bytes = bytes;
+    self
+  }
+
+  /// Control whether segment block indexes are embedded in the manifest.
+  pub fn manifest_embed_index(mut self, embed: bool) -> Self {
+    self.manifest_embed_index = embed;
     self
   }
 
