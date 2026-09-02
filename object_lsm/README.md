@@ -124,3 +124,16 @@ Notes: leases are cooperative (best-effort fencing); each shard is a separate
 engine instance — cross-shard queries/cluster routing stay an application
 concern (as in Redis Cluster).
 
+
+## fjall-alignment notes
+
+- `Partition::approximate_len` is O(#segments + memtable) — never a full
+  partition scan — so `WeDb::dbsize`-style calls stay cheap; duplicates across
+  segments intentionally overcount (approximate, like fjall's count).
+- recovery skips whole journal objects whose end-seq is at/below every
+  partition watermark, instead of decoding the entire history.
+- the segment-index cache is FIFO-bounded (4096) so metadata memory cannot
+  grow unboundedly with churn.
+- dropping the engine (windowed group-commit) flushes the pending journal
+  before stopping the background flusher, so a clean shutdown does not lose
+  acknowledged writes.

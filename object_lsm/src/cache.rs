@@ -81,22 +81,52 @@ impl BlockCache {
   }
 }
 
-/// Unbounded cache of parsed segment block indexes (small, hot metadata).
-#[derive(Clone, Default)]
+struct IndexCacheInner {
+  capacity: usize,
+  map: HashMap<u64, Arc<SegmentIndex>>,
+  order: VecDeque<u64>,
+}
+
+/// FIFO-bounded cache of parsed segment block indexes (small, hot metadata).
+#[derive(Clone)]
 pub struct IndexCache {
-  map: Arc<Mutex<HashMap<u64, Arc<SegmentIndex>>>>,
+  inner: Arc<Mutex<IndexCacheInner>>,
+}
+
+impl Default for IndexCache {
+  fn default() -> Self {
+    Self::new(4096)
+  }
 }
 
 impl IndexCache {
+  pub fn new(capacity: usize) -> Self {
+    Self {
+      inner: Arc::new(Mutex::new(IndexCacheInner {
+        capacity,
+        map: HashMap::new(),
+        order: VecDeque::new(),
+      })),
+    }
+  }
+
   pub fn get(&self, seg: u64) -> Option<Arc<SegmentIndex>> {
-    self.map.lock().unwrap().get(&seg).cloned()
+    self.inner.lock().unwrap().map.get(&seg).cloned()
   }
 
   pub fn insert(&self, seg: u64, index: Arc<SegmentIndex>) {
-    self.map.lock().unwrap().insert(seg, index);
+    let mut g = self.inner.lock().unwrap();
+    if g.map.insert(seg, index).is_none() {
+      g.order.push_back(seg);
+    }
+    while g.order.len() > g.capacity {
+      if let Some(old) = g.order.pop_front() {
+        g.map.remove(&old);
+      }
+    }
   }
 
   pub fn remove(&self, seg: u64) {
-    self.map.lock().unwrap().remove(&seg);
+    self.inner.lock().unwrap().map.remove(&seg);
   }
 }

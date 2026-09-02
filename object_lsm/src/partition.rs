@@ -282,6 +282,27 @@ impl Partition for ObjectLsmPartition {
     self.stream(range.0, range.1)
   }
 
+  fn approximate_len(&self) -> Result<usize> {
+    let st = self.inner.state.read();
+    let Some(ps) = st.partitions.get(&self.name) else {
+      return Ok(0);
+    };
+    // O(#segments + memtable), never a full partition scan: live values in the
+    // memtable plus per-segment raw entries minus tombstones (duplicates across
+    // segments intentionally overcount, matching an approximate LSM count).
+    let seg: usize = ps
+      .segments
+      .iter()
+      .map(|s| (s.count - s.tombstones) as usize)
+      .sum();
+    let mem = ps
+      .mem
+      .values()
+      .filter(|e| matches!(e, crate::state::MemEntry::Value(_)))
+      .count();
+    Ok(seg + mem)
+  }
+
   fn table_count(&self) -> usize {
     self
       .inner

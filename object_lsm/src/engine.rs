@@ -124,6 +124,12 @@ impl ObjectLsm {
 
 impl Drop for ObjectLsm {
   fn drop(&mut self) {
+    // Graceful shutdown: flush buffered group-commit journal before stopping
+    // the background flusher, so a clean close does not lose acked writes.
+    if self.inner.state.read().cfg.journal_window_ms.is_some() {
+      let mut st = self.inner.state.write();
+      let _ = flush_journal_pending(&*self.inner.store, &mut st);
+    }
     self.inner.journal_stop.store(true, Ordering::SeqCst);
     if let Some(lease) = self.lease.take() {
       drop(lease);
@@ -176,9 +182,20 @@ fn recover(store: &dyn Store, cfg: &Config) -> Result<EngineState> {
     }
   }
   st.journal_seq = max_seq;
+  let min_wm = st
+    .partitions
+    .values()
+    .map(|p| p.watermark)
+    .min()
+    .unwrap_or(0);
   let mut seqs: Vec<u64> = list.iter().filter_map(|k| parse_tail_seq(k)).collect();
   seqs.sort_unstable();
   for s in seqs {
+    // Groups in an object whose end-seq is at/below every partition watermark
+    // are already folded into durable segments; skip the whole object.
+    if s <= min_wm {
+      continue;
+    }
     let Some(bytes) = store.get(&journal_key(prefix, s))? else {
       continue;
     };
