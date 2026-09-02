@@ -32,7 +32,7 @@ use crate::{
     BLOCK_HEADER_LEN, BlockMeta, SegmentEntries, SegmentIndex, SegmentMeta, TAIL_LEN,
     build_segment_meta, decode_block, decode_index, encode_segment, find_block, parse_tail,
   },
-  state::{EngineState, MemEntry, PartitionLock, PartitionState, PartitionTable},
+  state::{EngineState, MemEntry, PartitionLock, PartitionState, PartitionTable, ReaderGate},
   store::Store,
 };
 
@@ -43,6 +43,8 @@ pub struct Inner {
   /// Serializes journal object PUTs so they never race while the global lock
   /// is free for partition/flush work (strict mode commits PUT outside `state`).
   pub journal_lock: Mutex<()>,
+  /// Gates segment-object deletion against in-flight readers.
+  pub readers: ReaderGate,
   /// Per-partition data-plane lock table (independent of `state`'s lock).
   pub partitions: PartitionTable,
   pub block_cache: BlockCache,
@@ -113,11 +115,13 @@ impl ObjectLsm {
     let block_cache = BlockCache::new(cfg.cache_capacity);
     let index_cache = IndexCache::default();
     let partitions = PartitionTable::default();
-    let state = recover(&*store, &cfg, &index_cache, &partitions)?;
+    let readers = ReaderGate::default();
+    let state = recover(&*store, &cfg, &index_cache, &partitions, &readers)?;
     let inner = Arc::new(Inner {
       store,
       state: RwLock::new(state),
       journal_lock: Mutex::new(()),
+      readers,
       partitions,
       block_cache,
       index_cache,
@@ -158,6 +162,7 @@ fn recover(
   cfg: &Config,
   index_cache: &IndexCache,
   partitions: &PartitionTable,
+  readers: &ReaderGate,
 ) -> Result<EngineState> {
   let mut st = EngineState::new(cfg.clone());
   let prefix = &cfg.prefix;
@@ -234,7 +239,7 @@ fn recover(
     let mut ps = lock.write();
     flush_partition(store, &mut st, &mut ps)?;
   }
-  maybe_compact_all_state(store, &mut st, partitions)?;
+  maybe_compact_all_state(store, &mut st, partitions, readers)?;
   gc_journal(store, &mut st);
   gc_objects_at_open(store, &mut st)?;
   Ok(st)
@@ -360,12 +365,11 @@ fn compact_partition_locked(
   store: &dyn Store,
   st: &mut EngineState,
   ps: &mut PartitionState,
-) -> Result<bool> {
+) -> Result<Option<Vec<SegmentMeta>>> {
   flush_partition(store, st, ps)?;
   let prefix = st.cfg.prefix.clone();
-  let eager = st.cfg.eager_object_delete;
   if !(!ps.meta.dropped && ps.meta.segments.len() > 1) {
-    return Ok(false);
+    return Ok(None);
   }
 
   // 1. fold all segments newest -> oldest into a single decision map.
@@ -385,26 +389,26 @@ fn compact_partition_locked(
     }
   }
 
-  // 3. write the merged result (or none), publish, then delete the old run.
-  let old = std::mem::take(&mut ps.meta.segments);
-  if !out.is_empty() {
+  // 3. upload the merged result first (failure keeps the old run intact),
+  //    then atomically swap the segment list and publish the manifest. Old
+  //    objects are deleted by the caller after releasing the partition lock.
+  let new_meta = if out.is_empty() {
+    None
+  } else {
     let encoded = encode_segment(&out, st.cfg.block_size as usize)?;
     let id = st.next_segment_id;
     st.next_segment_id += 1;
     store.put(&segment_key(&prefix, &ps.name, id), &encoded)?;
-    let meta = build_segment_meta(id, st.journal_seq, &encoded, &out)?;
-    ps.meta.segments.push(meta);
-  }
+    Some(build_segment_meta(id, st.journal_seq, &encoded, &out)?)
+  };
+
+  let new_segments = new_meta.map(|m| vec![m]).unwrap_or_default();
+  let old = std::mem::replace(&mut ps.meta.segments, new_segments);
   ps.meta.watermark = st.journal_seq;
   sync_partition_meta(st, ps);
   publish_manifest(store, st)?;
-  if eager {
-    for seg in &old {
-      let _ = store.delete(&segment_key(&prefix, &ps.name, seg.id));
-    }
-  }
   st.compactions_completed += 1;
-  Ok(true)
+  Ok(Some(old))
 }
 
 /// Compact every partition that reached the configured segment limit.
@@ -412,6 +416,7 @@ fn maybe_compact_all_state(
   store: &dyn Store,
   st: &mut EngineState,
   partitions: &PartitionTable,
+  _readers: &ReaderGate,
 ) -> Result<()> {
   let limit = st.cfg.max_segments_before_compact;
   for name in partitions.names() {
@@ -419,8 +424,14 @@ fn maybe_compact_all_state(
       continue;
     };
     let mut ps = lock.write();
-    if !ps.meta.dropped && ps.meta.segments.len() >= limit {
-      compact_partition_locked(store, st, &mut ps)?;
+    if !ps.meta.dropped && ps.meta.segments.len() >= limit
+      && let Some(old) = compact_partition_locked(store, st, &mut ps)?
+    {
+      if st.cfg.eager_object_delete {
+        for seg in old {
+          let _ = store.delete(&segment_key(&st.cfg.prefix, &name, seg.id));
+        }
+      }
     }
   }
   Ok(())
@@ -620,6 +631,7 @@ impl Inner {
       ps.apply(&op.key, op.value.as_deref());
     }
 
+    let mut deleted: Vec<(String, Vec<SegmentMeta>)> = Vec::new();
     {
       let mut st = self.state.write();
       let mem_limit = st.cfg.max_memtable_bytes;
@@ -634,17 +646,25 @@ impl Inner {
         .cloned()
         .collect();
       for name in over {
-        flush_partition(&*self.store, &mut st, guards.get_mut(&name).expect("guard"))?;
+        // Maintenance after the durability point must not turn an already
+        // committed batch into an error: leave the memtable for a later flush.
+        let _ = flush_partition(&*self.store, &mut st, guards.get_mut(&name).expect("guard"));
       }
 
       let seg_limit = st.cfg.max_segments_before_compact;
       for name in &names {
         let ps = guards.get_mut(name).expect("guard");
-        if !ps.meta.dropped && ps.meta.segments.len() >= seg_limit {
-          compact_partition_locked(&*self.store, &mut st, ps)?;
+        if !ps.meta.dropped && ps.meta.segments.len() >= seg_limit
+          && let Ok(Some(old)) = compact_partition_locked(&*self.store, &mut st, ps)
+        {
+          deleted.push((name.clone(), old));
         }
       }
       gc_journal(&*self.store, &mut st);
+    }
+    drop(guards);
+    for (name, old) in deleted {
+      self.delete_old_segments(&name, old);
     }
     Ok(())
   }
@@ -734,6 +754,8 @@ impl Inner {
   /// Point lookup: memtable, then segments newest -> oldest using the block
   /// index to fetch only the candidate block.
   pub(crate) fn lookup(&self, name: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    // Reader token prevents segment-object deletion while this lookup runs.
+    let _gate = self.readers.enter();
     let prefix = self.state.read().cfg.prefix.clone();
     let Some(lock) = self.partitions.get(name) else {
       return Ok(None);
@@ -771,6 +793,10 @@ impl Inner {
   }
 
   pub(crate) fn clear_partition(&self, name: &str) -> Result<()> {
+    // Gate deletes against readers (before taking the partition lock), and
+    // publish the cleared manifest before deleting old objects: a crash only
+    // leaves orphan objects, never a manifest pointing at deleted segments.
+    let _del = self.readers.exclusive();
     let Some(lock) = self.partition_lock(name) else {
       return Ok(());
     };
@@ -779,12 +805,7 @@ impl Inner {
     let prefix = st.cfg.prefix.clone();
     let eager = st.cfg.eager_object_delete;
     let tail_seq = st.journal_seq;
-    for seg in ps.meta.segments.drain(..) {
-      if eager {
-        let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
-      }
-      self.index_cache.remove(seg.id);
-    }
+    let old = std::mem::take(&mut ps.meta.segments);
     ps.mem.clear();
     ps.mem_bytes = 0;
     ps.meta.watermark = tail_seq;
@@ -792,10 +813,17 @@ impl Inner {
     sync_partition_meta(&mut st, &ps);
     publish_manifest(&*self.store, &mut st)?;
     gc_journal(&*self.store, &mut st);
+    for seg in old {
+      if eager {
+        let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
+      }
+      self.index_cache.remove(seg.id);
+    }
     Ok(())
   }
 
   pub(crate) fn rm_partition(&self, name: &str) -> Result<()> {
+    let _del = self.readers.exclusive();
     let Some(lock) = self.partition_lock(name) else {
       return Ok(());
     };
@@ -804,12 +832,7 @@ impl Inner {
     let prefix = st.cfg.prefix.clone();
     let eager = st.cfg.eager_object_delete;
     let tail_seq = st.journal_seq;
-    for seg in ps.meta.segments.drain(..) {
-      if eager {
-        let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
-      }
-      self.index_cache.remove(seg.id);
-    }
+    let old = std::mem::take(&mut ps.meta.segments);
     ps.mem.clear();
     ps.mem_bytes = 0;
     ps.meta.watermark = tail_seq;
@@ -817,6 +840,12 @@ impl Inner {
     sync_partition_meta(&mut st, &ps);
     publish_manifest(&*self.store, &mut st)?;
     gc_journal(&*self.store, &mut st);
+    for seg in old {
+      if eager {
+        let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
+      }
+      self.index_cache.remove(seg.id);
+    }
     Ok(())
   }
 
@@ -825,10 +854,16 @@ impl Inner {
     let Some(lock) = self.partition_lock(name) else {
       return Ok(());
     };
-    let mut ps = lock.write();
-    let mut st = self.state.write();
-    compact_partition_locked(&*self.store, &mut st, &mut ps)?;
-    gc_journal(&*self.store, &mut st);
+    let old = {
+      let mut ps = lock.write();
+      let mut st = self.state.write();
+      let old = compact_partition_locked(&*self.store, &mut st, &mut ps)?;
+      gc_journal(&*self.store, &mut st);
+      old
+    };
+    if let Some(old) = old {
+      self.delete_old_segments(name, old);
+    }
     Ok(())
   }
 
@@ -839,14 +874,41 @@ impl Inner {
       let Some(lock) = self.partition_lock(&name) else {
         continue;
       };
-      let mut ps = lock.write();
-      let mut st = self.state.write();
-      if !ps.meta.dropped && (!ps.mem.is_empty() || ps.meta.segments.len() > 1) {
-        compact_partition_locked(&*self.store, &mut st, &mut ps)?;
+      let old = {
+        let mut ps = lock.write();
+        let mut st = self.state.write();
+        let old = if !ps.meta.dropped && (!ps.mem.is_empty() || ps.meta.segments.len() > 1) {
+          compact_partition_locked(&*self.store, &mut st, &mut ps)?
+        } else {
+          None
+        };
+        gc_journal(&*self.store, &mut st);
+        old
+      };
+      if let Some(old) = old {
+        self.delete_old_segments(&name, old);
       }
-      gc_journal(&*self.store, &mut st);
     }
     Ok(())
+  }
+
+  /// Delete old segment objects after the partition lock has been released,
+  /// waiting for any in-flight readers to drain first.
+  fn delete_old_segments(&self, part: &str, old: Vec<SegmentMeta>) {
+    if old.is_empty() {
+      return;
+    }
+    let _del = self.readers.exclusive();
+    let (eager, prefix) = {
+      let st = self.state.read();
+      (st.cfg.eager_object_delete, st.cfg.prefix.clone())
+    };
+    for seg in old {
+      if eager {
+        let _ = self.store.delete(&segment_key(&prefix, part, seg.id));
+      }
+      self.index_cache.remove(seg.id);
+    }
   }
 }
 
@@ -950,3 +1012,5 @@ impl Engine for ObjectLsm {
     self.inner.compact_all()
   }
 }
+
+

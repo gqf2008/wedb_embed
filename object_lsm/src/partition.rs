@@ -8,7 +8,8 @@ use crate::{
   engine::Inner,
   error::{Error, Result},
   journal::Op,
-  scan::{BackMerge, Bounds, FwdMerge},
+  scan::{BackMerge, Bounds, FwdMerge, Snap, snap_from},
+  state::ReadGuard,
 };
 
 /// Partition handle: identifies a keyspace by name and shares engine state.
@@ -51,6 +52,11 @@ pub struct ObjectLsmIter {
   bounds: Bounds,
   fwd: Option<FwdMerge>,
   back: Option<BackMerge>,
+  /// Consistent partition snapshot cloned under the owned read guard below.
+  snap: Snap,
+  /// Owned partition read guard kept for the iterator's lifetime: compaction /
+  /// clear / rm must wait for an active scan before deleting segment objects.
+  _gate: ReadGuard,
   /// Largest key already delivered by `next()` (the forward low-water mark).
   front_watermark: Option<Vec<u8>>,
   /// Smallest key already delivered by `next_back()` (the backward high-water mark).
@@ -60,10 +66,27 @@ pub struct ObjectLsmIter {
 
 impl ObjectLsmIter {
   fn new(inner: Arc<Inner>, part: String, bounds: Bounds) -> Self {
+    // Owned reader token blocks segment-object deletion for the iterator's
+    // whole lifetime; the snapshot is cloned under a brief partition read lock.
+    let gate = inner.readers.enter();
+    let prefix = inner.state.read().cfg.prefix.clone();
+    let snap = match inner.partitions.get(&part) {
+      Some(lock) => {
+        let guard = lock.read();
+        snap_from(prefix, &guard, &bounds)
+      }
+      None => Snap {
+        prefix,
+        mem: Vec::new(),
+        segments: Vec::new(),
+      },
+    };
     Self {
       inner,
       part,
       bounds,
+      snap,
+      _gate: gate,
       fwd: None,
       back: None,
       front_watermark: None,
@@ -78,6 +101,7 @@ impl ObjectLsmIter {
         self.inner.clone(),
         self.part.clone(),
         self.bounds.clone(),
+        self.snap.clone(),
       )?);
     }
     Ok(())
@@ -89,6 +113,7 @@ impl ObjectLsmIter {
         self.inner.clone(),
         self.part.clone(),
         self.bounds.clone(),
+        self.snap.clone(),
       )?);
     }
     Ok(())

@@ -73,6 +73,96 @@ impl PartitionState {
 /// Shared, independently lockable partition state.
 pub type PartitionLock = Arc<RwLock<PartitionState>>;
 
+/// Reader/writer gate guarding segment-object deletion against in-flight
+/// readers. `ReadGuard` is owned (no borrow), so an iterator can hold it for
+/// its whole lifetime; `WriteGuard` is acquired only while deleting old
+/// segment objects and waits for every active reader to drain first.
+pub struct ReaderGate {
+  inner: Arc<GateInner>,
+}
+
+struct GateInner {
+  mu: parking_lot::Mutex<GateState>,
+  cv: parking_lot::Condvar,
+}
+
+impl Default for GateInner {
+  fn default() -> Self {
+    Self {
+      mu: parking_lot::Mutex::new(GateState::default()),
+      cv: parking_lot::Condvar::new(),
+    }
+  }
+}
+
+#[derive(Default)]
+struct GateState {
+  readers: usize,
+  writer: bool,
+}
+
+impl Default for ReaderGate {
+  fn default() -> Self {
+    Self { inner: Arc::new(GateInner::default()) }
+  }
+}
+
+pub struct ReadGuard {
+  inner: Arc<GateInner>,
+}
+
+pub struct WriteGuard {
+  inner: Arc<GateInner>,
+}
+
+impl ReaderGate {
+  pub fn enter(&self) -> ReadGuard {
+    let inner = self.inner.clone();
+    let mut g = inner.mu.lock();
+    while g.writer {
+      inner.cv.wait(&mut g);
+    }
+    g.readers += 1;
+    drop(g);
+    ReadGuard { inner }
+  }
+
+  pub fn exclusive(&self) -> WriteGuard {
+    let inner = self.inner.clone();
+    let mut g = inner.mu.lock();
+    g.writer = true;
+    inner.cv.notify_all();
+    while g.readers > 0 {
+      inner.cv.wait(&mut g);
+    }
+    drop(g);
+    WriteGuard { inner }
+  }
+}
+
+impl Drop for ReadGuard {
+  fn drop(&mut self) {
+    let notify = {
+      let mut g = self.inner.mu.lock();
+      g.readers = g.readers.saturating_sub(1);
+      g.readers == 0
+    };
+    if notify {
+      self.inner.cv.notify_all();
+    }
+  }
+}
+
+impl Drop for WriteGuard {
+  fn drop(&mut self) {
+    {
+      let mut g = self.inner.mu.lock();
+      g.writer = false;
+    }
+    self.inner.cv.notify_all();
+  }
+}
+
 /// Lock table for the per-partition data plane.
 ///
 /// This lives *outside* [`EngineState`]'s global lock: acquiring a partition
@@ -97,10 +187,7 @@ impl PartitionTable {
     }
     let lock = Arc::new(RwLock::new(PartitionState::new(name.to_string())));
     let mut map = self.map.write();
-    map
-      .entry(name.to_string())
-      .or_insert_with(|| lock.clone())
-      .clone()
+    map.entry(name.to_string()).or_insert_with(|| lock.clone()).clone()
   }
 
   /// Snapshot every lock currently in the table.
@@ -159,3 +246,4 @@ impl EngineState {
     self.partitions.entry(name.to_string()).or_default();
   }
 }
+

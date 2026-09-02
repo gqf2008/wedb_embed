@@ -16,7 +16,7 @@ use crate::{
   engine::Inner,
   error::Result,
   segment::{SegmentIndex, SegmentMeta},
-  state::MemEntry,
+  state::{MemEntry, PartitionState},
 };
 
 /// Owned inclusive/exclusive scan bounds (cloned from caller slices).
@@ -76,23 +76,17 @@ fn seg_overlaps(seg: &SegmentMeta, b: &Bounds) -> bool {
 
 type KV = (Vec<u8>, Option<Vec<u8>>);
 
-/// Consistent snapshot of one partition taken under the state read lock.
-struct Snap {
-  prefix: String,
-  mem: Vec<KV>,
-  segments: Vec<SegmentMeta>,
+/// Consistent snapshot of one partition, cloned while holding the partition
+/// read lock (the caller keeps the owned read guard alive for the scan's life).
+#[derive(Clone)]
+pub(crate) struct Snap {
+  pub(crate) prefix: String,
+  pub(crate) mem: Vec<KV>,
+  pub(crate) segments: Vec<SegmentMeta>,
 }
 
-fn snapshot(inner: &Arc<Inner>, part: &str, b: &Bounds) -> Snap {
-  let prefix = inner.state.read().cfg.prefix.clone();
-  let Some(lock) = inner.partitions.get(part) else {
-    return Snap {
-      prefix,
-      mem: Vec::new(),
-      segments: Vec::new(),
-    };
-  };
-  let ps = lock.read();
+/// Clone the bounded view of `ps` without releasing its read lock.
+pub(crate) fn snap_from(prefix: String, ps: &PartitionState, b: &Bounds) -> Snap {
   let mem = ps
     .mem
     .iter()
@@ -250,8 +244,7 @@ pub struct FwdMerge {
 }
 
 impl FwdMerge {
-  pub fn new(eng: Arc<Inner>, part: String, bounds: Bounds) -> Result<Self> {
-    let snap = snapshot(&eng, &part, &bounds);
+  pub fn new(eng: Arc<Inner>, part: String, bounds: Bounds, snap: Snap) -> Result<Self> {
     let mut heap = BinaryHeap::new();
     if !snap.mem.is_empty() {
       let mut kind = FwdKind::Mem {
@@ -463,8 +456,7 @@ pub struct BackMerge {
 }
 
 impl BackMerge {
-  pub fn new(eng: Arc<Inner>, part: String, bounds: Bounds) -> Result<Self> {
-    let snap = snapshot(&eng, &part, &bounds);
+  pub fn new(eng: Arc<Inner>, part: String, bounds: Bounds, snap: Snap) -> Result<Self> {
     let mut heap = BinaryHeap::new();
     if !snap.mem.is_empty() {
       let n = snap.mem.len();
@@ -546,3 +538,4 @@ impl BackMerge {
     }
   }
 }
+
