@@ -999,6 +999,10 @@ impl Engine for ObjectLsm {
       .sum()
   }
 
+  fn journal_count(&self) -> usize {
+    self.inner.state.read().journal_seqs.len()
+  }
+
   fn cache_size(&self) -> u64 {
     self.inner.block_cache.used()
   }

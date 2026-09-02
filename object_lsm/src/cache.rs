@@ -56,8 +56,14 @@ impl BlockCache {
     if g.capacity == 0 {
       return;
     }
-    if let Some(old) = g.map.get(&(seg, block)) {
-      g.used = g.used.saturating_sub(old.size);
+    // Refresh in place when the key already exists so `order` and `used` stay
+    // consistent (no duplicate FIFO entries, no double accounting).
+    if let Some(old_size) = g.map.get(&(seg, block)).map(|c| c.size) {
+      g.used = g.used.saturating_sub(old_size).saturating_add(size);
+      let existing = g.map.get_mut(&(seg, block)).expect("cached block present");
+      existing.entries = entries;
+      existing.size = size;
+      return;
     }
     g.map.insert((seg, block), CachedBlock { entries, size });
     g.used += size;
@@ -127,6 +133,8 @@ impl IndexCache {
   }
 
   pub fn remove(&self, seg: u64) {
-    self.inner.lock().unwrap().map.remove(&seg);
+    let mut g = self.inner.lock().unwrap();
+    g.map.remove(&seg);
+    g.order.retain(|k| *k != seg);
   }
 }
