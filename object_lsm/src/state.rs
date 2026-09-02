@@ -103,7 +103,9 @@ struct GateState {
 
 impl Default for ReaderGate {
   fn default() -> Self {
-    Self { inner: Arc::new(GateInner::default()) }
+    Self {
+      inner: Arc::new(GateInner::default()),
+    }
   }
 }
 
@@ -187,7 +189,10 @@ impl PartitionTable {
     }
     let lock = Arc::new(RwLock::new(PartitionState::new(name.to_string())));
     let mut map = self.map.write();
-    map.entry(name.to_string()).or_insert_with(|| lock.clone()).clone()
+    map
+      .entry(name.to_string())
+      .or_insert_with(|| lock.clone())
+      .clone()
   }
 
   /// Snapshot every lock currently in the table.
@@ -246,4 +251,3 @@ impl EngineState {
     self.partitions.entry(name.to_string()).or_default();
   }
 }
-

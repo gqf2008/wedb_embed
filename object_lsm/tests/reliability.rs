@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use wedb_embed_engine::{Engine, Partition};
+use wedb_embed_engine::{Engine, KvEntry, Partition};
 use wedb_object_lsm::{Config, MemoryStore, ObjectLsm, Store, keys::journal_prefix};
 
 #[test]
@@ -59,4 +59,22 @@ fn approximate_len_is_fast_and_overcounts_duplicates() {
   assert_eq!(p.approximate_len().unwrap(), 3);
   // And it must never be less than the exact live count.
   assert!(p.approximate_len().unwrap() >= p.len().unwrap());
+}
+
+#[test]
+fn prefix_with_trailing_ff_returns_only_matching_keys() {
+  let store = MemoryStore::new();
+  let cfg = Config::new("rel/prefix-ff").max_memtable_bytes(1 << 20);
+  let db = ObjectLsm::open(Arc::new(store), cfg).unwrap();
+  let p = db.partition("data").unwrap();
+  for k in [&b"a\xff0"[..], b"a\xff1", b"a\xff", b"b", b"c"] {
+    p.insert(k, b"v").unwrap();
+  }
+  let got: Vec<Vec<u8>> = p
+    .prefix(b"a\xff")
+    .map(|e| e.unwrap().key().to_vec())
+    .collect();
+  let mut want = vec![b"a\xff".to_vec(), b"a\xff0".to_vec(), b"a\xff1".to_vec()];
+  want.sort();
+  assert_eq!(got, want, "prefix ending in 0xFF must not leak b/c keys");
 }

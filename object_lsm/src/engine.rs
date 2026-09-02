@@ -50,7 +50,11 @@ pub struct Inner {
   pub block_cache: BlockCache,
   pub index_cache: IndexCache,
   /// Stops the background group-commit journal flusher thread.
-  pub journal_stop: AtomicBool,
+  pub journal_stop: Arc<AtomicBool>,
+  /// Shared lease-lost flag used for best-effort write fencing; the lease
+  /// object itself is owned by the `ObjectLsm` handle (not by `Inner`), so
+  /// partition handles cannot prolong its lifetime.
+  pub lease_lost: parking_lot::Mutex<Option<Arc<AtomicBool>>>,
 }
 
 /// Object-storage-backed LSM engine implementing the wedb_embed_engine traits.
@@ -79,8 +83,7 @@ pub struct Inner {
 #[derive(Clone)]
 pub struct ObjectLsm {
   pub(crate) inner: Arc<Inner>,
-  /// Held writer lease when opened via [`ObjectLsm::open_leased`]; keeps the
-  /// heartbeat alive for the engine's lifetime and releases on drop.
+  /// Writer lease (owned by this handle); released when the last handle drops.
   pub(crate) lease: Option<Arc<Lease>>,
 }
 
@@ -107,6 +110,7 @@ impl ObjectLsm {
   pub fn open_leased(store: Arc<dyn Store>, cfg: Config, opts: LeaseOptions) -> Result<Self> {
     let lease = Lease::acquire(store.clone(), &cfg.prefix, opts)?;
     let mut engine = Self::build(store, cfg)?;
+    *engine.inner.lease_lost.lock() = Some(lease.lost_flag());
     engine.lease = Some(Arc::new(lease));
     Ok(engine)
   }
@@ -117,6 +121,7 @@ impl ObjectLsm {
     let partitions = PartitionTable::default();
     let readers = ReaderGate::default();
     let state = recover(&*store, &cfg, &index_cache, &partitions, &readers)?;
+    let journal_stop = Arc::new(AtomicBool::new(false));
     let inner = Arc::new(Inner {
       store,
       state: RwLock::new(state),
@@ -125,7 +130,8 @@ impl ObjectLsm {
       partitions,
       block_cache,
       index_cache,
-      journal_stop: AtomicBool::new(false),
+      journal_stop: journal_stop.clone(),
+      lease_lost: parking_lot::Mutex::new(None),
     });
     if cfg.journal_window_ms.is_some() {
       spawn_journal_flusher(inner.clone());
@@ -136,16 +142,21 @@ impl ObjectLsm {
 
 impl Drop for ObjectLsm {
   fn drop(&mut self) {
-    // Graceful shutdown: flush buffered group-commit journal before stopping
-    // the background flusher, so a clean close does not lose acked writes.
-    if self.inner.state.read().cfg.journal_window_ms.is_some() {
-      let mut st = self.inner.state.write();
-      let _ = flush_journal_pending(&*self.inner.store, &mut st);
-    }
-    self.inner.journal_stop.store(true, Ordering::SeqCst);
     if let Some(lease) = self.lease.take() {
       drop(lease);
     }
+  }
+}
+
+impl Drop for Inner {
+  fn drop(&mut self) {
+    // Graceful shutdown: flush buffered group-commit journal before stopping
+    // the background flusher, so a clean close does not lose acked writes.
+    if self.state.read().cfg.journal_window_ms.is_some() {
+      let mut st = self.state.write();
+      let _ = flush_journal_pending(&*self.store, &mut st);
+    }
+    self.journal_stop.store(true, Ordering::SeqCst);
   }
 }
 
@@ -424,13 +435,13 @@ fn maybe_compact_all_state(
       continue;
     };
     let mut ps = lock.write();
-    if !ps.meta.dropped && ps.meta.segments.len() >= limit
+    if !ps.meta.dropped
+      && ps.meta.segments.len() >= limit
+      && st.cfg.eager_object_delete
       && let Some(old) = compact_partition_locked(store, st, &mut ps)?
     {
-      if st.cfg.eager_object_delete {
-        for seg in old {
-          let _ = store.delete(&segment_key(&st.cfg.prefix, &name, seg.id));
-        }
+      for seg in old {
+        let _ = store.delete(&segment_key(&st.cfg.prefix, &name, seg.id));
       }
     }
   }
@@ -519,17 +530,22 @@ fn spawn_journal_flusher(inner: Arc<Inner>) {
   let Some(ms) = inner.state.read().cfg.journal_window_ms else {
     return;
   };
+  let weak = Arc::downgrade(&inner);
+  let stop = inner.journal_stop.clone();
   thread::Builder::new()
     .name("objectlsm-journal".into())
     .spawn(move || {
       loop {
-        if inner.journal_stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) {
           return;
         }
         thread::sleep(Duration::from_millis(ms));
-        if inner.journal_stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) {
           return;
         }
+        let Some(inner) = weak.upgrade() else {
+          return;
+        };
         {
           let mut st = inner.state.write();
           if !st.pending.is_empty() && flush_journal_pending(&*inner.store, &mut st).is_ok() {
@@ -542,6 +558,21 @@ fn spawn_journal_flusher(inner: Arc<Inner>) {
 }
 
 impl Inner {
+  /// Best-effort fencing: reject mutations once the held writer lease has
+  /// been marked lost (e.g. heartbeat renewal failed after expiry).
+  fn ensure_writer(&self) -> Result<()> {
+    let lost = self
+      .lease_lost
+      .lock()
+      .as_ref()
+      .map(|flag| flag.load(Ordering::SeqCst))
+      .unwrap_or(false);
+    if lost {
+      return Err(Error::store("writer lease lost"));
+    }
+    Ok(())
+  }
+
   pub(crate) fn partition_lock(&self, name: &str) -> Option<PartitionLock> {
     self.partitions.get(name)
   }
@@ -573,6 +604,7 @@ impl Inner {
     if ops.is_empty() {
       return Ok(());
     }
+    self.ensure_writer()?;
     let mut names: Vec<String> = ops.iter().map(|op| op.part.clone()).collect();
     names.sort();
     names.dedup();
@@ -654,7 +686,8 @@ impl Inner {
       let seg_limit = st.cfg.max_segments_before_compact;
       for name in &names {
         let ps = guards.get_mut(name).expect("guard");
-        if !ps.meta.dropped && ps.meta.segments.len() >= seg_limit
+        if !ps.meta.dropped
+          && ps.meta.segments.len() >= seg_limit
           && let Ok(Some(old)) = compact_partition_locked(&*self.store, &mut st, ps)
         {
           deleted.push((name.clone(), old));
@@ -672,6 +705,7 @@ impl Inner {
   /// Ensure a partition exists and is not marked dropped (re-create clears the
   /// dropped flag, keeping its watermark to avoid stale journal replays).
   pub(crate) fn touch_partition(&self, name: &str) -> Result<()> {
+    self.ensure_writer()?;
     let lock = self.partitions.create(name);
     let mut ps = lock.write();
     if ps.meta.dropped {
@@ -793,6 +827,7 @@ impl Inner {
   }
 
   pub(crate) fn clear_partition(&self, name: &str) -> Result<()> {
+    self.ensure_writer()?;
     // Gate deletes against readers (before taking the partition lock), and
     // publish the cleared manifest before deleting old objects: a crash only
     // leaves orphan objects, never a manifest pointing at deleted segments.
@@ -823,6 +858,7 @@ impl Inner {
   }
 
   pub(crate) fn rm_partition(&self, name: &str) -> Result<()> {
+    self.ensure_writer()?;
     let _del = self.readers.exclusive();
     let Some(lock) = self.partition_lock(name) else {
       return Ok(());
@@ -851,6 +887,7 @@ impl Inner {
 
   /// Flush + merge-compact a single partition.
   pub(crate) fn compact_partition(&self, name: &str) -> Result<()> {
+    self.ensure_writer()?;
     let Some(lock) = self.partition_lock(name) else {
       return Ok(());
     };
@@ -869,6 +906,7 @@ impl Inner {
 
   /// Flush + merge-compact every non-dropped partition.
   pub(crate) fn compact_all(&self) -> Result<()> {
+    self.ensure_writer()?;
     let names = self.partitions.names();
     for name in names {
       let Some(lock) = self.partition_lock(&name) else {
@@ -1012,5 +1050,3 @@ impl Engine for ObjectLsm {
     self.inner.compact_all()
   }
 }
-
-

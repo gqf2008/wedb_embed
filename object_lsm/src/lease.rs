@@ -78,7 +78,10 @@ struct LeaseInner {
   owner: String,
   ttl_ms: u128,
   stop: AtomicBool,
-  lost: AtomicBool,
+  lost: Arc<AtomicBool>,
+  /// Serializes renew / release / heartbeat get-check-write sequences within
+  /// this lease instance (cross-instance fencing is still best-effort).
+  op: parking_lot::Mutex<()>,
   stop_tx: Option<std::sync::mpsc::Sender<()>>,
 }
 
@@ -108,7 +111,12 @@ impl Lease {
       match store.get(&key) {
         Ok(None) => {
           if store.create(&key, &payload(&opts.owner, ttl_ms))? {
-            break;
+            // Verify we still own the lease; a concurrent stale-takeover may
+            // have deleted us already (best-effort fencing).
+            let owned = matches!(store.get(&key)?, Some(b) if parse_payload(&b).ok().map(|(o, _)| o) == Some(opts.owner.clone()));
+            if owned {
+              break;
+            }
           }
         }
         Ok(Some(bytes)) => {
@@ -134,7 +142,8 @@ impl Lease {
       owner: opts.owner.clone(),
       ttl_ms,
       stop: AtomicBool::new(false),
-      lost: AtomicBool::new(false),
+      lost: Arc::new(AtomicBool::new(false)),
+      op: parking_lot::Mutex::new(()),
       stop_tx: Some(stop_tx),
     });
     if opts.heartbeat {
@@ -154,8 +163,14 @@ impl Lease {
     self.inner.lost.load(Ordering::SeqCst)
   }
 
+  /// Shared lost flag for the engine's best-effort write fencing.
+  pub fn lost_flag(&self) -> Arc<AtomicBool> {
+    self.inner.lost.clone()
+  }
+
   /// Renew by extending the expiry, provided the record still belongs to us.
   pub fn renew(&self) -> Result<bool> {
+    let _g = self.inner.op.lock();
     let store = &self.inner.store;
     match store.get(&self.inner.key)? {
       None => {
@@ -183,19 +198,12 @@ impl Lease {
       let _ = tx.send(());
     }
     self.inner.stop.store(true, Ordering::SeqCst);
-    let _ = self.renew_if_ours_delete();
-  }
-
-  fn renew_if_ours_delete(&self) -> Result<()> {
-    match self.inner.store.get(&self.inner.key)? {
-      None => Ok(()),
-      Some(bytes) => {
-        let (owner, _) = parse_payload(&bytes)?;
-        if owner == self.inner.owner {
-          let _ = self.inner.store.delete(&self.inner.key);
-        }
-        Ok(())
-      }
+    let _g = self.inner.op.lock();
+    if let Ok(Some(bytes)) = self.inner.store.get(&self.inner.key)
+      && let Ok((owner, _)) = parse_payload(&bytes)
+      && owner == self.inner.owner
+    {
+      let _ = self.inner.store.delete(&self.inner.key);
     }
   }
 }
@@ -222,6 +230,7 @@ fn spawn_heartbeat(inner: Arc<LeaseInner>, stop_rx: std::sync::mpsc::Receiver<()
           return;
         }
         // Renew; on failure (owner changed / deleted) mark lost and quit.
+        let _g = inner.op.lock();
         let ok = match inner.store.get(&inner.key) {
           Ok(Some(bytes)) => match parse_payload(&bytes) {
             Ok((owner, _)) if owner == inner.owner => inner

@@ -538,4 +538,3 @@ impl BackMerge {
     }
   }
 }
-

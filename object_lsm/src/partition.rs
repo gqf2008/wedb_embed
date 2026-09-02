@@ -120,6 +120,23 @@ impl ObjectLsmIter {
   }
 }
 
+/// Lexicographic successor of `prefix`: the exclusive upper bound of the key
+/// range that starts with `prefix`. Trailing `0xFF` bytes carry correctly, and
+/// an all-`0xFF` prefix has no successor (the upper bound is unbounded, which
+/// is still exact because every larger key shares the prefix).
+fn prefix_successor(prefix: &[u8]) -> Bound<Vec<u8>> {
+  let mut end = prefix.to_vec();
+  while let Some(last) = end.last_mut() {
+    if *last == u8::MAX {
+      end.pop();
+    } else {
+      *last += 1;
+      return Bound::Excluded(end);
+    }
+  }
+  Bound::Unbounded
+}
+
 fn bound_owned(b: Bound<&[u8]>) -> Bound<Vec<u8>> {
   match b {
     Bound::Included(x) => Bound::Included(x.to_vec()),
@@ -240,14 +257,11 @@ impl Partition for ObjectLsmPartition {
   }
 
   fn prefix(&self, prefix: &[u8]) -> Self::Iter<'_> {
-    let mut end = prefix.to_vec();
-    let upper = match end.last_mut() {
-      None => Bound::Unbounded,
-      Some(last) if *last == u8::MAX => Bound::Unbounded,
-      Some(last) => {
-        *last += 1;
-        Bound::Excluded(end.as_slice())
-      }
+    let upper = prefix_successor(prefix);
+    let upper = match &upper {
+      Bound::Included(v) => Bound::Included(v.as_slice()),
+      Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+      Bound::Unbounded => Bound::Unbounded,
     };
     self.stream(Bound::Included(prefix), upper)
   }
