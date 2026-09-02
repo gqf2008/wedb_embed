@@ -5,7 +5,9 @@
 
 use std::{ops::Range, sync::Arc};
 
-use object_store::{ObjectStore, PutPayload, aws::AmazonS3Builder, path::Path as ObjPath};
+use object_store::{
+  ObjectStore, PutMode, PutOptions, PutPayload, aws::AmazonS3Builder, path::Path as ObjPath,
+};
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -128,6 +130,29 @@ impl Store for R2Store {
         .await
         .map(|_| ())
         .map_err(Self::obj_err)
+    })
+  }
+
+  fn create(&self, key: &str, data: &[u8]) -> Result<bool> {
+    let p = path(key)?;
+    let inner = self.inner.clone();
+    let payload = PutPayload::from(data.to_vec());
+    self.block(async move {
+      match inner
+        .put_opts(
+          &p,
+          payload,
+          PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+          },
+        )
+        .await
+      {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+        Err(e) => Err(Self::obj_err(e)),
+      }
     })
   }
 

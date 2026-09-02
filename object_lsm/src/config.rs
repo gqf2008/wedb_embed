@@ -71,4 +71,11 @@ impl Config {
     self.max_segments_before_compact = n;
     self
   }
+
+  /// Config for one shard of a shared bucket layout: each shard owns a
+  /// disjoint `<base>/shard-<id>` prefix, so separate writer instances can
+  /// run concurrently without colliding.
+  pub fn for_shard(base: impl Into<String>, shard: u64) -> Self {
+    Self::new(format!("{}/shard-{shard}", base.into()))
+  }
 }

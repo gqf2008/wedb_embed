@@ -5,7 +5,7 @@ use std::{
   sync::{Arc, Mutex},
 };
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Minimal object-storage interface required by the engine.
 ///
@@ -25,6 +25,14 @@ pub trait Store: Send + Sync + 'static {
 
   /// Delete an object; deleting a missing key is a no-op.
   fn delete(&self, key: &str) -> Result<()>;
+
+  /// Atomically create an object only if it does not exist yet.
+  ///
+  /// Returns `true` when the object was created, `false` when it already
+  /// exists (used by the writer lease; default backend reports unsupported).
+  fn create(&self, _key: &str, _data: &[u8]) -> Result<bool> {
+    Err(Error::store("create-if-absent not supported by this store"))
+  }
 
   /// List object keys under `prefix` in lexicographic order.
   fn list(&self, prefix: &str) -> Result<Vec<String>>;
@@ -76,6 +84,16 @@ impl Store for MemoryStore {
   fn delete(&self, key: &str) -> Result<()> {
     self.inner.lock().unwrap().objects.remove(key);
     Ok(())
+  }
+
+  fn create(&self, key: &str, data: &[u8]) -> Result<bool> {
+    let mut g = self.inner.lock().unwrap();
+    if g.objects.contains_key(key) {
+      Ok(false)
+    } else {
+      g.objects.insert(key.to_string(), data.to_vec());
+      Ok(true)
+    }
   }
 
   fn list(&self, prefix: &str) -> Result<Vec<String>> {

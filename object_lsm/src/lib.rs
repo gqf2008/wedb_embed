@@ -24,6 +24,7 @@ pub mod engine;
 pub mod error;
 pub mod journal;
 pub mod keys;
+pub mod lease;
 pub mod manifest;
 pub mod partition;
 #[cfg(feature = "r2")]
@@ -50,5 +51,6 @@ impl From<Error> for wedb_embed::Error {
   }
 }
 
+pub use lease::{Lease, LeaseOptions};
 #[cfg(feature = "r2")]
 pub use r2::{R2Config, R2Store};

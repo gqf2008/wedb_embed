@@ -93,3 +93,27 @@ The R2 write cost is dominated by the per-commit journal object PUT. The next
 engineering lever is group-commit journal batching (amortize many commits into
 one PUT) plus larger segments, which is where ObjectLsm's S3 story gets its
 throughput back on real object stores.
+
+## Multi-instance shared bucket: lease + sharding
+
+`ObjectLsm::open_leased(store, cfg, LeaseOptions)` makes an instance the
+exclusive writer of `cfg.prefix`:
+
+- acquisition is atomic create-if-absent on `<prefix>/lease`
+  (`Store::create`; R2 uses `PutMode::Create`, MemoryStore is atomic);
+- the owner renews via a background heartbeat (TTL/3); losing renewal marks
+  the lease lost, so a crashed writer is taken over once its lease expires;
+- the lease is released when the last engine handle drops.
+
+Parallel writers share a bucket by sharding into disjoint prefixes:
+
+```rust
+let cfg0 = Config::for_shard("myapp/db", 0); // .../shard-0
+let cfg1 = Config::for_shard("myapp/db", 1); // .../shard-1
+ObjectLsm::open_leased(store.clone(), cfg0, lease("w0"))?; // independent writer
+ObjectLsm::open_leased(store.clone(), cfg1, lease("w1"))?;
+```
+
+Notes: leases are cooperative (best-effort fencing); each shard is a separate
+engine instance — cross-shard queries/cluster routing stay an application
+concern (as in Redis Cluster).

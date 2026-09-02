@@ -1,0 +1,242 @@
+//! Writer lease for sharing one bucket prefix between instances.
+//!
+//! A lease is an object at `<prefix>/lease` whose payload is
+//! `owner\n<expiry-ms>`. Acquisition is atomic via `Store::create`
+//! (create-if-absent); a stale lease (past expiry) can be deleted and
+//! re-created. The owner renews on a heartbeat; losing renewal marks the lease
+//! lost. A separate instance/shard uses its own prefix.
+
+use std::{
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
+  thread,
+  time::{Duration, Instant},
+};
+
+use crate::{
+  error::{Error, Result},
+  store::Store,
+};
+
+/// Object key holding the lease record.
+pub fn lease_key(prefix: &str) -> String {
+  format!("{prefix}/lease")
+}
+
+/// Lease acquisition parameters.
+#[derive(Clone, Debug)]
+pub struct LeaseOptions {
+  pub owner: String,
+  /// How long a lease lives without renewal.
+  pub ttl: Duration,
+  /// How long to keep retrying acquisition before giving up.
+  pub timeout: Duration,
+  /// Whether to run a background heartbeat renewal thread.
+  pub heartbeat: bool,
+}
+
+impl Default for LeaseOptions {
+  fn default() -> Self {
+    Self {
+      owner: "writer".into(),
+      ttl: Duration::from_secs(30),
+      timeout: Duration::from_secs(5),
+      heartbeat: true,
+    }
+  }
+}
+
+fn now_ms() -> u128 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_millis()
+}
+
+fn payload(owner: &str, ttl_ms: u128) -> Vec<u8> {
+  format!("{owner}\n{}", now_ms() + ttl_ms).into_bytes()
+}
+
+fn parse_payload(bytes: &[u8]) -> Result<(String, u128)> {
+  let text =
+    std::str::from_utf8(bytes).map_err(|e| Error::Corrupt(format!("lease not utf-8: {e}")))?;
+  let (owner, expiry) = text
+    .split_once('\n')
+    .ok_or_else(|| Error::Corrupt("lease payload malformed".into()))?;
+  let expiry_ms: u128 = expiry
+    .trim()
+    .parse()
+    .map_err(|_| Error::Corrupt("lease expiry malformed".into()))?;
+  Ok((owner.to_string(), expiry_ms))
+}
+
+struct LeaseInner {
+  store: Arc<dyn Store>,
+  key: String,
+  owner: String,
+  ttl_ms: u128,
+  stop: AtomicBool,
+  lost: AtomicBool,
+  stop_tx: Option<std::sync::mpsc::Sender<()>>,
+}
+
+/// A held writer lease on `<prefix>/lease`.
+#[derive(Clone)]
+pub struct Lease {
+  inner: Arc<LeaseInner>,
+}
+
+impl std::fmt::Debug for Lease {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Lease")
+      .field("key", &self.inner.key)
+      .field("owner", &self.inner.owner)
+      .field("lost", &self.inner.lost.load(Ordering::SeqCst))
+      .finish()
+  }
+}
+
+impl Lease {
+  /// Try to acquire the lease, retrying until `opts.timeout`.
+  pub fn acquire(store: Arc<dyn Store>, prefix: &str, opts: LeaseOptions) -> Result<Self> {
+    let key = lease_key(prefix);
+    let ttl_ms = opts.ttl.as_millis().max(1);
+    let deadline = Instant::now() + opts.timeout;
+    loop {
+      match store.get(&key) {
+        Ok(None) => {
+          if store.create(&key, &payload(&opts.owner, ttl_ms))? {
+            break;
+          }
+        }
+        Ok(Some(bytes)) => {
+          // Steal a lease that has already expired.
+          if let Ok((_, expiry)) = parse_payload(&bytes)
+            && expiry <= now_ms()
+          {
+            let _ = store.delete(&key);
+          }
+        }
+        Err(e) => return Err(e),
+      }
+      if Instant::now() >= deadline {
+        return Err(Error::store(format!("lease {key} held by another writer")));
+      }
+      thread::sleep(Duration::from_millis(50));
+    }
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let inner = Arc::new(LeaseInner {
+      store: store.clone(),
+      key,
+      owner: opts.owner.clone(),
+      ttl_ms,
+      stop: AtomicBool::new(false),
+      lost: AtomicBool::new(false),
+      stop_tx: Some(stop_tx),
+    });
+    if opts.heartbeat {
+      spawn_heartbeat(inner.clone(), stop_rx);
+    } else {
+      // keep rx alive by storing nothing; drop
+      let _ = stop_rx;
+    }
+    Ok(Self { inner })
+  }
+
+  pub fn owner(&self) -> &str {
+    &self.inner.owner
+  }
+
+  pub fn is_lost(&self) -> bool {
+    self.inner.lost.load(Ordering::SeqCst)
+  }
+
+  /// Renew by extending the expiry, provided the record still belongs to us.
+  pub fn renew(&self) -> Result<bool> {
+    let store = &self.inner.store;
+    match store.get(&self.inner.key)? {
+      None => {
+        self.inner.lost.store(true, Ordering::SeqCst);
+        Ok(false)
+      }
+      Some(bytes) => {
+        let (owner, _) = parse_payload(&bytes)?;
+        if owner != self.inner.owner {
+          self.inner.lost.store(true, Ordering::SeqCst);
+          return Ok(false);
+        }
+        store.put(
+          &self.inner.key,
+          &payload(&self.inner.owner, self.inner.ttl_ms),
+        )?;
+        Ok(true)
+      }
+    }
+  }
+
+  /// Stop the heartbeat and delete the lease if it still belongs to us.
+  pub fn release(&self) {
+    if let Some(tx) = &self.inner.stop_tx {
+      let _ = tx.send(());
+    }
+    self.inner.stop.store(true, Ordering::SeqCst);
+    let _ = self.renew_if_ours_delete();
+  }
+
+  fn renew_if_ours_delete(&self) -> Result<()> {
+    match self.inner.store.get(&self.inner.key)? {
+      None => Ok(()),
+      Some(bytes) => {
+        let (owner, _) = parse_payload(&bytes)?;
+        if owner == self.inner.owner {
+          let _ = self.inner.store.delete(&self.inner.key);
+        }
+        Ok(())
+      }
+    }
+  }
+}
+
+impl Drop for Lease {
+  fn drop(&mut self) {
+    self.release();
+  }
+}
+
+fn spawn_heartbeat(inner: Arc<LeaseInner>, stop_rx: std::sync::mpsc::Receiver<()>) {
+  let interval = Duration::from_millis((inner.ttl_ms / 3).max(50) as u64);
+  thread::Builder::new()
+    .name("objectlsm-lease".into())
+    .spawn(move || {
+      loop {
+        if inner.stop.load(Ordering::SeqCst) {
+          return;
+        }
+        if stop_rx.recv_timeout(interval).is_ok() {
+          return;
+        }
+        if inner.stop.load(Ordering::SeqCst) {
+          return;
+        }
+        // Renew; on failure (owner changed / deleted) mark lost and quit.
+        let ok = match inner.store.get(&inner.key) {
+          Ok(Some(bytes)) => match parse_payload(&bytes) {
+            Ok((owner, _)) if owner == inner.owner => inner
+              .store
+              .put(&inner.key, &payload(&inner.owner, inner.ttl_ms))
+              .is_ok(),
+            _ => false,
+          },
+          _ => false,
+        };
+        if !ok {
+          inner.lost.store(true, Ordering::SeqCst);
+          return;
+        }
+      }
+    })
+    .ok();
+}

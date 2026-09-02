@@ -17,6 +17,7 @@ use crate::{
     current_key, journal_key, journal_prefix, manifest_key, manifest_prefix, parse_tail_seq,
     segment_key, segment_root,
   },
+  lease::{Lease, LeaseOptions},
   manifest::{Manifest, PartitionMeta},
   partition::ObjectLsmPartition,
   segment::{
@@ -61,6 +62,9 @@ pub struct Inner {
 #[derive(Clone)]
 pub struct ObjectLsm {
   pub(crate) inner: Arc<Inner>,
+  /// Held writer lease when opened via [`ObjectLsm::open_leased`]; keeps the
+  /// heartbeat alive for the engine's lifetime and releases on drop.
+  pub(crate) lease: Option<Arc<Lease>>,
 }
 
 impl std::fmt::Debug for ObjectLsm {
@@ -74,6 +78,23 @@ impl std::fmt::Debug for ObjectLsm {
 impl ObjectLsm {
   /// Open (or create) an engine instance in `store` under `cfg.prefix`.
   pub fn open(store: Arc<dyn Store>, cfg: Config) -> Result<Self> {
+    Self::build(store, cfg)
+  }
+
+  /// Open as the exclusive writer of `cfg.prefix`, acquiring an expiring
+  /// object lease first (for multi-instance access to a shared bucket).
+  ///
+  /// Fails once [`LeaseOptions::timeout`] elapses while another writer holds
+  /// the lease. The lease is renewed by a background heartbeat and released
+  /// when the last handle to this engine is dropped.
+  pub fn open_leased(store: Arc<dyn Store>, cfg: Config, opts: LeaseOptions) -> Result<Self> {
+    let lease = Lease::acquire(store.clone(), &cfg.prefix, opts)?;
+    let mut engine = Self::build(store, cfg)?;
+    engine.lease = Some(Arc::new(lease));
+    Ok(engine)
+  }
+
+  fn build(store: Arc<dyn Store>, cfg: Config) -> Result<Self> {
     let state = recover(&*store, &cfg)?;
     let block_cache = BlockCache::new(cfg.cache_capacity);
     let index_cache = IndexCache::default();
@@ -84,7 +105,16 @@ impl ObjectLsm {
         block_cache,
         index_cache,
       }),
+      lease: None,
     })
+  }
+}
+
+impl Drop for ObjectLsm {
+  fn drop(&mut self) {
+    if let Some(lease) = self.lease.take() {
+      drop(lease);
+    }
   }
 }
 
