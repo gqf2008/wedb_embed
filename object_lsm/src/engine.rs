@@ -1,5 +1,6 @@
 //! Engine implementation: open/recovery, commit pipeline, segment flush,
-//! manifest publishing, block/range read path and the [`Engine`] trait impl.
+//! merge compaction, garbage collection, manifest publishing and the
+//! [`Engine`] trait impl.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -12,7 +13,10 @@ use crate::{
   config::Config,
   error::{Error, Result},
   journal::{Group, Op, decode_group, encode_group},
-  keys::{current_key, journal_key, journal_prefix, manifest_key, parse_tail_seq, segment_key},
+  keys::{
+    current_key, journal_key, journal_prefix, manifest_key, manifest_prefix, parse_tail_seq,
+    segment_key, segment_root,
+  },
   manifest::{Manifest, PartitionMeta},
   partition::ObjectLsmPartition,
   segment::{
@@ -33,7 +37,7 @@ pub struct Inner {
 
 /// Object-storage-backed LSM engine implementing the wedb_embed_engine traits.
 ///
-/// # Consistency model (M1)
+/// # Consistency model
 /// - every [`Batch`] commit first uploads one immutable journal group object
 ///   (the atomic durability point), then applies the group to memtables;
 /// - memtables spill into immutable block-indexed segment objects once they
@@ -42,6 +46,16 @@ pub struct Inner {
 ///   journal watermarks;
 /// - opening re-reads `current -> manifest` and replays journal groups newer
 ///   than each partition watermark, so a crash loses nothing that was acked.
+///
+/// # Compaction & GC (M3)
+/// - partitions with more than `Config::max_segments_before_compact` segments
+///   are merged into one fresh segment (newest-wins, tombstones dropped only
+///   after every older segment has been folded in);
+/// - merge publishing order is `upload new -> publish manifest -> delete old`,
+///   so a crash between steps only leaves orphan objects, never lost data;
+/// - applied journal groups (`seq <= min partition watermark`) are deleted;
+/// - opening garbage-collects segment objects not referenced by the current
+///   manifest and superseded manifest snapshots.
 ///
 /// [`Batch`]: wedb_embed_engine::Batch
 #[derive(Clone)]
@@ -74,7 +88,8 @@ impl ObjectLsm {
   }
 }
 
-/// Rebuild in-memory state from the durable manifest + journal tail.
+/// Rebuild in-memory state from the durable manifest + journal tail, then run
+/// startup compaction/G C.
 fn recover(store: &dyn Store, cfg: &Config) -> Result<EngineState> {
   let mut st = EngineState::new(cfg.clone());
   let prefix = &cfg.prefix;
@@ -111,15 +126,15 @@ fn recover(store: &dyn Store, cfg: &Config) -> Result<EngineState> {
   // Replay every journal group newer than its partition watermark.
   let list = store.list(&journal_prefix(prefix))?;
   let mut max_seq = st.journal_seq;
-  let mut seqs = Vec::new();
   for k in &list {
     if let Some(s) = parse_tail_seq(k) {
       max_seq = max_seq.max(s);
-      seqs.push(s);
+      st.journal_seqs.insert(s);
     }
   }
-  seqs.sort_unstable();
   st.journal_seq = max_seq;
+  let mut seqs: Vec<u64> = list.iter().filter_map(|k| parse_tail_seq(k)).collect();
+  seqs.sort_unstable();
   for s in seqs {
     let Some(bytes) = store.get(&journal_key(prefix, s))? else {
       continue;
@@ -138,6 +153,9 @@ fn recover(store: &dyn Store, cfg: &Config) -> Result<EngineState> {
   for name in over {
     flush_partition(store, &mut st, &name)?;
   }
+  maybe_compact_all(store, &mut st)?;
+  gc_journal(store, &mut st);
+  gc_objects_at_open(store, &mut st)?;
   Ok(st)
 }
 
@@ -223,6 +241,163 @@ fn flush_partition(store: &dyn Store, st: &mut EngineState, name: &str) -> Resul
   publish_manifest(store, st)
 }
 
+/// Read every entry of a segment object via tail/index/block Range GETs
+/// (no caching; used by the compaction merge).
+fn read_segment_entries(
+  store: &dyn Store,
+  prefix: &str,
+  part: &str,
+  seg: &SegmentMeta,
+) -> Result<SegmentEntries> {
+  let key = segment_key(prefix, part, seg.id);
+  let tail_raw = store
+    .get_range(
+      &key,
+      seg.bytes.saturating_sub(TAIL_LEN as u64),
+      TAIL_LEN as u64,
+    )?
+    .ok_or_else(|| Error::Corrupt(format!("segment {} tail missing", seg.id)))?;
+  let tail = parse_tail(&tail_raw)?;
+  let idx_raw = store
+    .get_range(&key, tail.index_offset as u64, tail.index_len as u64)?
+    .ok_or_else(|| Error::Corrupt(format!("segment {} index missing", seg.id)))?;
+  let index = decode_index(&idx_raw)?;
+  let mut out = SegmentEntries::new();
+  for bm in &index.blocks {
+    let raw = store
+      .get_range(&key, bm.offset as u64, bm.len as u64)?
+      .ok_or_else(|| Error::Corrupt(format!("segment {} block missing", seg.id)))?;
+    if raw.len() < BLOCK_HEADER_LEN {
+      return Err(Error::Corrupt("block shorter than header".into()));
+    }
+    out.extend(decode_block(&raw)?);
+  }
+  Ok(out)
+}
+
+/// Merge every segment of a partition into one fresh segment: read newest ->
+/// oldest, keep only the surviving values, drop tombstones only after all
+/// older segments have been folded in, publish, then delete the old objects.
+fn compact_partition_locked(store: &dyn Store, st: &mut EngineState, name: &str) -> Result<bool> {
+  flush_partition(store, st, name)?;
+  let prefix = st.cfg.prefix.clone();
+  let need = {
+    let ps = st.partitions.get(name);
+    matches!(ps, Some(p) if !p.dropped && p.segments.len() > 1)
+  };
+  if !need {
+    return Ok(false);
+  }
+  // 1. fold all segments newest -> oldest into a single decision map.
+  let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+  {
+    let ps = st.partitions.get(name).expect("partition present");
+    for seg in ps.segments.iter().rev() {
+      let entries = read_segment_entries(store, &prefix, name, seg)?;
+      for (k, v) in entries {
+        map.entry(k).or_insert(v);
+      }
+    }
+  }
+  // 2. drop tombstones: nothing older than the merged run survives.
+  let mut out: SegmentEntries = Vec::with_capacity(map.len());
+  for (k, v) in map {
+    if let Some(val) = v {
+      out.push((k, Some(val)));
+    }
+  }
+  // 3. write the merged result (or none), publish, then delete the old run.
+  let ps = st.partitions.get_mut(name).expect("partition present");
+  let old = std::mem::take(&mut ps.segments);
+  if !out.is_empty() {
+    let encoded = encode_segment(&out, st.cfg.block_size as usize)?;
+    let id = st.next_segment_id;
+    st.next_segment_id += 1;
+    store.put(&segment_key(&prefix, name, id), &encoded)?;
+    let meta = build_segment_meta(id, st.journal_seq, &encoded, &out)?;
+    ps.segments.push(meta);
+  }
+  ps.watermark = st.journal_seq;
+  publish_manifest(store, st)?;
+  for seg in &old {
+    let _ = store.delete(&segment_key(&prefix, name, seg.id));
+  }
+  st.compactions_completed += 1;
+  Ok(true)
+}
+
+/// Compact every partition that reached the configured segment limit.
+fn maybe_compact_all(store: &dyn Store, st: &mut EngineState) -> Result<()> {
+  let names: Vec<String> = st
+    .partitions
+    .values()
+    .filter(|p| !p.dropped && p.segments.len() >= st.cfg.max_segments_before_compact)
+    .map(|p| p.name.clone())
+    .collect();
+  for name in names {
+    compact_partition_locked(store, st, &name)?;
+  }
+  Ok(())
+}
+
+/// Delete journal objects whose seq is at or below every partition watermark
+/// (they are folded into segments or were deliberately discarded).
+fn gc_journal(store: &dyn Store, st: &mut EngineState) {
+  let min_wm = st
+    .partitions
+    .values()
+    .map(|p| p.watermark)
+    .min()
+    .unwrap_or(0);
+  if min_wm == 0 {
+    return;
+  }
+  let doomed: Vec<u64> = st.journal_seqs.range(..=min_wm).copied().collect();
+  for s in doomed {
+    let _ = store.delete(&journal_key(&st.cfg.prefix, s));
+    st.journal_seqs.remove(&s);
+  }
+}
+
+/// Startup GC: delete segment objects not referenced by the current manifest
+/// and manifest snapshots superseded by `current`.
+fn gc_objects_at_open(store: &dyn Store, st: &mut EngineState) -> Result<()> {
+  let prefix = st.cfg.prefix.clone();
+  let seg_root = segment_root(&prefix);
+  let seg_prefix = format!("{prefix}/seg/");
+  let live: BTreeMap<String, Vec<u64>> = st
+    .partitions
+    .iter()
+    .filter(|(_, p)| !p.dropped)
+    .map(|(name, p)| (name.clone(), p.segments.iter().map(|s| s.id).collect()))
+    .collect();
+  for key in store.list(&seg_root)? {
+    let rest = match key.strip_prefix(&seg_prefix) {
+      Some(r) => r,
+      None => continue,
+    };
+    let Some((part, id_s)) = rest.rsplit_once('/') else {
+      continue;
+    };
+    let Ok(id) = id_s.parse::<u64>() else {
+      continue;
+    };
+    let referenced = live.get(part).map(|ids| ids.contains(&id)).unwrap_or(false);
+    if !referenced {
+      let _ = store.delete(&key);
+    }
+  }
+  let cur = st.manifest_seq;
+  for key in store.list(&manifest_prefix(&prefix))? {
+    if let Some(seq) = parse_tail_seq(&key)
+      && seq != cur
+    {
+      let _ = store.delete(&key);
+    }
+  }
+  Ok(())
+}
+
 impl Inner {
   /// Atomically commit an op group (journal PUT first, then apply).
   pub(crate) fn commit_ops(&self, ops: Vec<Op>) -> Result<()> {
@@ -235,6 +410,7 @@ impl Inner {
     let group = Group { seq, ops };
     let bytes = encode_group(&group)?;
     self.store.put(&journal_key(&st.cfg.prefix, seq), &bytes)?;
+    st.journal_seqs.insert(seq);
     apply_group(&mut st, &group)?;
     let over: Vec<String> = st
       .partitions
@@ -245,6 +421,8 @@ impl Inner {
     for name in over {
       flush_partition(&*self.store, &mut st, &name)?;
     }
+    maybe_compact_all(&*self.store, &mut st)?;
+    gc_journal(&*self.store, &mut st);
     Ok(())
   }
 
@@ -432,7 +610,9 @@ impl Inner {
       ps.watermark = tail_seq;
       ps.dropped = false;
     }
-    publish_manifest(&*self.store, &mut st)
+    publish_manifest(&*self.store, &mut st)?;
+    gc_journal(&*self.store, &mut st);
+    Ok(())
   }
 
   pub(crate) fn rm_partition(&self, name: &str) -> Result<()> {
@@ -453,25 +633,32 @@ impl Inner {
       ps.watermark = tail_seq;
       ps.dropped = true;
     }
-    publish_manifest(&*self.store, &mut st)
+    publish_manifest(&*self.store, &mut st)?;
+    gc_journal(&*self.store, &mut st);
+    Ok(())
   }
 
+  /// Flush + merge-compact a single partition.
   pub(crate) fn compact_partition(&self, name: &str) -> Result<()> {
     let mut st = self.state.write();
-    flush_partition(&*self.store, &mut st, name)
+    compact_partition_locked(&*self.store, &mut st, name)?;
+    gc_journal(&*self.store, &mut st);
+    Ok(())
   }
 
-  pub(crate) fn flush_all(&self) -> Result<()> {
+  /// Flush + merge-compact every non-dropped partition.
+  pub(crate) fn compact_all(&self) -> Result<()> {
     let mut st = self.state.write();
     let names: Vec<String> = st
       .partitions
       .values()
-      .filter(|p| !p.dropped && !p.mem.is_empty())
+      .filter(|p| !p.dropped && (!p.mem.is_empty() || p.segments.len() > 1))
       .map(|p| p.name.clone())
       .collect();
     for name in names {
-      flush_partition(&*self.store, &mut st, &name)?;
+      compact_partition_locked(&*self.store, &mut st, &name)?;
     }
+    gc_journal(&*self.store, &mut st);
     Ok(())
   }
 }
@@ -569,6 +756,10 @@ impl Engine for ObjectLsm {
     self.inner.block_cache.capacity()
   }
 
+  fn compactions_completed(&self) -> usize {
+    self.inner.state.read().compactions_completed as usize
+  }
+
   fn batch(&self) -> Self::Batch {
     ObjectLsmBatch::new(self.inner.clone())
   }
@@ -578,8 +769,8 @@ impl Engine for ObjectLsm {
   }
 
   fn persist(&self) -> Result<()> {
-    // M1: every committed group is already a durable journal object, so
-    // persist() is a no-op consistency point.
+    // Every committed group is already a durable journal object, so persist()
+    // is a no-op consistency point.
     Ok(())
   }
 
@@ -594,7 +785,6 @@ impl Engine for ObjectLsm {
   }
 
   fn compact(&self) -> Result<()> {
-    // M1: fold every memtable into a segment. Segment-merging compaction is M3.
-    self.inner.flush_all()
+    self.inner.compact_all()
   }
 }

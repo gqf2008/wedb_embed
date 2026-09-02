@@ -6,6 +6,8 @@ pub const DEFAULT_MAX_MEMTABLE_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_BLOCK_SIZE: u32 = 32 * 1024;
 /// Default block cache capacity.
 pub const DEFAULT_CACHE_CAPACITY: u64 = 64 * 1024 * 1024;
+/// Segments per partition allowed before an automatic merge compaction.
+pub const DEFAULT_MAX_SEGMENTS_BEFORE_COMPACT: usize = 16;
 /// Default object-key prefix.
 pub const DEFAULT_PREFIX: &str = "wedb/objectlsm";
 
@@ -21,6 +23,8 @@ pub struct Config {
   pub block_size: u32,
   /// Block cache capacity in bytes (0 disables the cache).
   pub cache_capacity: u64,
+  /// Merge-compact a partition once it holds this many segments.
+  pub max_segments_before_compact: usize,
 }
 
 impl Default for Config {
@@ -30,6 +34,7 @@ impl Default for Config {
       max_memtable_bytes: DEFAULT_MAX_MEMTABLE_BYTES,
       block_size: DEFAULT_BLOCK_SIZE,
       cache_capacity: DEFAULT_CACHE_CAPACITY,
+      max_segments_before_compact: DEFAULT_MAX_SEGMENTS_BEFORE_COMPACT,
     }
   }
 }
@@ -58,6 +63,12 @@ impl Config {
   /// Set the block cache capacity in bytes.
   pub fn cache_capacity(mut self, bytes: u64) -> Self {
     self.cache_capacity = bytes;
+    self
+  }
+
+  /// Set the segment count that triggers automatic merge compaction.
+  pub fn max_segments_before_compact(mut self, n: usize) -> Self {
+    self.max_segments_before_compact = n;
     self
   }
 }

@@ -1,6 +1,6 @@
 //! In-memory engine state (partitions + counters).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{config::Config, segment::SegmentMeta};
 
@@ -76,6 +76,10 @@ pub struct EngineState {
   /// Last manifest seq written (0 = none).
   pub manifest_seq: u64,
   pub next_segment_id: u64,
+  /// Journal group seqs whose objects still exist (maintained for GC).
+  pub journal_seqs: BTreeSet<u64>,
+  /// Completed merge compactions (metrics).
+  pub compactions_completed: u64,
 }
 
 impl EngineState {
@@ -86,6 +90,8 @@ impl EngineState {
       journal_seq: 0,
       manifest_seq: 0,
       next_segment_id: 0,
+      journal_seqs: BTreeSet::new(),
+      compactions_completed: 0,
     }
   }
 }

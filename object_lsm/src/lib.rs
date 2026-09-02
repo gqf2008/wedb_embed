@@ -12,7 +12,8 @@
 //! - a small **manifest** object records live segments + per-partition watermark.
 //!
 //! M2 done: block-indexed segments, byte-range reads, block/index caches and
-//! ordered streaming iteration (forward/backward merges). Next: M3 compaction.
+//! ordered streaming iteration. M3 done: merge compaction, journal GC and
+//! orphan GC at open. Next: M4 compatibility harness + R2 remote Store.
 
 pub mod batch;
 pub mod cache;

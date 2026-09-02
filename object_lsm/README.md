@@ -16,6 +16,13 @@ write:  Batch::commit -> immutable journal group object (atomic PUT)
                         -> publish manifest (segment list + watermark)
 read:   memtable hit (µs) -> block-indexed Range GET scans through block cache
 crash:  current -> manifest -> replay journal groups newer than watermark
+
+write-adjacent maintenance:
+  - merge compaction folds a partition's segments into one (upload -> publish
+    manifest -> delete old objects) once max_segments_before_compact is hit
+  - applied journal groups (seq <= min partition watermark) are deleted
+  - opening GCs segments not referenced by the current manifest and superseded
+    manifest snapshots
 ```
 
 - every committed group is a separate immutable journal object, so a PUT is the
@@ -31,7 +38,7 @@ crash:  current -> manifest -> replay journal groups newer than watermark
 - [x] M0 scaffold: crate + `Store` abstraction + in-memory store + codec
 - [x] M1 vertical slice: memtable/journal/segment/manifest, recovery, Engine impl
 - [x] M2 ordered streaming iteration, block-indexed segments + block cache
-- [ ] M3 compaction + orphan GC + journal GC
+- [x] M3 compaction + orphan GC + journal GC
 - [ ] M4 compatibility harness vs `wedb_embed` tests + benchmarks
 - [ ] R2/S3 remote `Store` backend (feature-gated, needs credentials)
 
@@ -40,4 +47,5 @@ crash:  current -> manifest -> replay journal groups newer than watermark
 ```sh
 cargo test -p wedb_object_lsm
 ```
+
 

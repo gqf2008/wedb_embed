@@ -26,6 +26,11 @@ pub fn segment_key(prefix: &str, part: &str, id: u64) -> String {
   format!("{prefix}/seg/{part}/{id:020}")
 }
 
+/// Root key prefix under which all segment objects live.
+pub fn segment_root(prefix: &str) -> String {
+  format!("{prefix}/seg/")
+}
+
 pub fn journal_prefix(prefix: &str) -> String {
   format!("{prefix}/journal/")
 }
