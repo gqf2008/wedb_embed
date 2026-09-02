@@ -40,7 +40,7 @@ write-adjacent maintenance:
 - [x] M2 ordered streaming iteration, block-indexed segments + block cache
 - [x] M3 compaction + orphan GC + journal GC
 - [x] M4 compatibility harness vs `wedb_embed` tests + benchmarks
-- [ ] R2/S3 remote `Store` backend (feature-gated, needs credentials)
+- [x] R2/S3 remote `Store` backend (feature `r2`, `object_store` sync bridge)
 
 ## Test
 
@@ -55,6 +55,20 @@ compatibility harness: identical Redis-style scripts (string/hash/list/set/
 zset/bitmap/stream + cross-type errors + namespaces) run against both `Fjall`
 (reference) and `ObjectLsm`, asserting byte-identical result logs, and a
 reopen-persistence test for `ObjectLsm`.
+
+## Cloudflare R2 backend
+
+`R2Store` (feature `r2`) implements the [`Store`] trait over Cloudflare R2 /
+any S3-compatible endpoint via `object_store`, bridging async I/O with an
+internal tokio runtime. Byte-range reads map to S3 Range GETs.
+
+```sh
+# credentials come from the environment (never commit them):
+#   R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY
+#   R2_ENDPOINT (or R2_ACCOUNT_ID to derive it)
+cargo test -p wedb_object_lsm --features r2 --test r2   # live roundtrip; skips w/o env
+```
+
 
 
 

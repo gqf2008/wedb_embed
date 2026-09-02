@@ -14,7 +14,7 @@
 //! M2 done: block-indexed segments, byte-range reads, block/index caches and
 //! ordered streaming iteration. M3 done: merge compaction, journal GC and
 //! orphan GC at open. M4 done: wedb_embed parity harness + benchmarks.
-//! Next: R2/S3 remote Store backend.
+//! R2/S3 remote Store backend (2 feature) done; live-verified on R2.
 
 pub mod batch;
 pub mod cache;
@@ -26,6 +26,8 @@ pub mod journal;
 pub mod keys;
 pub mod manifest;
 pub mod partition;
+#[cfg(feature = "r2")]
+pub mod r2;
 mod scan;
 pub mod segment;
 pub mod state;
@@ -47,4 +49,7 @@ impl From<Error> for wedb_embed::Error {
     wedb_embed::Error::engine(e.to_string())
   }
 }
+
+#[cfg(feature = "r2")]
+pub use r2::{R2Config, R2Store};
 
