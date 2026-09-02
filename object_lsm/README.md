@@ -120,9 +120,12 @@ ObjectLsm::open_leased(store.clone(), cfg0, lease("w0"))?; // independent writer
 ObjectLsm::open_leased(store.clone(), cfg1, lease("w1"))?;
 ```
 
-Notes: leases are cooperative (best-effort fencing); each shard is a separate
-engine instance — cross-shard queries/cluster routing stay an application
-concern (as in Redis Cluster).
+Notes: leases are cooperative (best-effort fencing). A stale-lease takeover is
+not strictly single-writer under object stores that lack a conditional delete;
+it is narrowed with an ownership re-check after create but cannot be made
+airtight without compare-and-delete / conditional-write support. Each shard is
+a separate engine instance — cross-shard queries/cluster routing stay an
+application concern (as in Redis Cluster).
 
 
 ## fjall-alignment notes
@@ -137,3 +140,4 @@ concern (as in Redis Cluster).
 - dropping the engine (windowed group-commit) flushes the pending journal
   before stopping the background flusher, so a clean shutdown does not lose
   acknowledged writes.
+
