@@ -199,3 +199,102 @@ fn reopen_streaming_matches_forward() {
   let p2 = db2.partition("data").unwrap();
   assert_eq!(collect_fwd(&p2), expect_vec(&expect));
 }
+#[test]
+fn mixed_direction_interleaved_matches_full() {
+  let (db, _store) = open("s/mixed-interleaved");
+  let p = db.partition("data").unwrap();
+  let expect = build(&db);
+  let full = expect_vec(&expect);
+
+  let mut it = p.iter();
+  let mut got = Vec::new();
+  let mut front_done = false;
+  let mut back_done = false;
+  while !front_done || !back_done {
+    if !front_done {
+      match it.next() {
+        Some(Ok(e)) => got.push((e.key().to_vec(), e.value().to_vec())),
+        Some(Err(e)) => panic!("scan error: {e}"),
+        None => front_done = true,
+      }
+    }
+    if !back_done {
+      match it.next_back() {
+        Some(Ok(e)) => got.push((e.key().to_vec(), e.value().to_vec())),
+        Some(Err(e)) => panic!("scan error: {e}"),
+        None => back_done = true,
+      }
+    }
+  }
+
+  let mut sorted = got.clone();
+  sorted.sort();
+  assert_eq!(sorted, full);
+
+  let mut seen = std::collections::BTreeSet::new();
+  for (k, _) in &got {
+    assert!(
+      seen.insert(k.clone()),
+      "duplicate key {}",
+      String::from_utf8_lossy(k)
+    );
+  }
+}
+
+#[test]
+fn mixed_direction_boundary_duplicate_and_tombstone() {
+  let (db, _store) = open("s/mixed-boundary");
+  let p = db.partition("data").unwrap();
+  let mut expect: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+  // Two segments: the first contains every key, the second overwrites k012 and
+  // deletes k013, so the newest-wins duplicate and the tombstone both sit on
+  // the boundary between the forward prefix and the backward suffix below.
+  for i in 0..26 {
+    let k = key(i);
+    let v = val(i, 0);
+    p.insert(&k, &v).unwrap();
+    expect.insert(k, v);
+  }
+  db.compact().unwrap();
+
+  let k_dup = key(12);
+  let v_new = val(12, 1);
+  p.insert(&k_dup, &v_new).unwrap();
+  expect.insert(k_dup.clone(), v_new.clone());
+  let k_tomb = key(13);
+  p.rm(&k_tomb).unwrap();
+  expect.remove(&k_tomb);
+  db.compact().unwrap();
+
+  let full = expect_vec(&expect);
+  let mut it = p.iter();
+
+  let mut head = Vec::new();
+  for _ in 0..13 {
+    let e = it.next().unwrap().unwrap();
+    head.push((e.key().to_vec(), e.value().to_vec()));
+  }
+  let mut tail = Vec::new();
+  for _ in 0..5 {
+    let e = it.next_back().unwrap().unwrap();
+    tail.push((e.key().to_vec(), e.value().to_vec()));
+  }
+  let mut rest = Vec::new();
+  loop {
+    match it.next() {
+      Some(Ok(e)) => rest.push((e.key().to_vec(), e.value().to_vec())),
+      Some(Err(e)) => panic!("scan error: {e}"),
+      None => break,
+    }
+  }
+
+  assert_eq!(head, full[..13]);
+  let mut exp_tail = full[full.len() - 5..].to_vec();
+  exp_tail.reverse();
+  assert_eq!(tail, exp_tail);
+  assert_eq!(rest, full[13..full.len() - 5]);
+  assert!(!head.iter().any(|(k, _)| *k == k_tomb));
+  assert!(!rest.iter().any(|(k, _)| *k == k_tomb));
+  assert!(head.iter().any(|(k, v)| *k == key(12) && *v == val(12, 1)));
+}

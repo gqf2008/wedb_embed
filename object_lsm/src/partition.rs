@@ -38,29 +38,23 @@ impl KvEntry for ObjectLsmEntry {
   }
 }
 
-/// Materialized fallback used once a scan mixes forward and backward pulls.
-struct Mat {
-  entries: Vec<ObjectLsmEntry>,
-  front: usize,
-  back: usize,
-}
-
 /// Ordered iterator over a partition snapshot.
 ///
-/// Pure `next()` streams through a forward K-way merge (one block per source
-/// in memory); pure `next_back()` streams backward the same way. Mixing the two
-/// directions materializes the remaining result set once to stay correct.
+/// Pure `next()` streams through a forward K-way merge and pure `next_back()`
+/// streams backward the same way. When the two directions are mixed, both
+/// streaming cursors are advanced independently and guarded by the two
+/// delivered-key watermarks below, so the iterator never materializes the
+/// remaining result set.
 pub struct ObjectLsmIter {
   inner: Arc<Inner>,
   part: String,
   bounds: Bounds,
   fwd: Option<FwdMerge>,
   back: Option<BackMerge>,
-  mat: Option<Mat>,
-  front_used: bool,
-  back_used: bool,
-  front_done: usize,
-  back_done: usize,
+  /// Largest key already delivered by `next()` (the forward low-water mark).
+  front_watermark: Option<Vec<u8>>,
+  /// Smallest key already delivered by `next_back()` (the backward high-water mark).
+  back_watermark: Option<Vec<u8>>,
   err: Option<Error>,
 }
 
@@ -72,63 +66,32 @@ impl ObjectLsmIter {
       bounds,
       fwd: None,
       back: None,
-      mat: None,
-      front_used: false,
-      back_used: false,
-      front_done: 0,
-      back_done: 0,
+      front_watermark: None,
+      back_watermark: None,
       err: None,
     }
   }
 
-  fn materialize(&mut self) -> Result<()> {
-    if self.mat.is_some() {
-      return Ok(());
+  fn ensure_fwd(&mut self) -> Result<()> {
+    if self.fwd.is_none() {
+      self.fwd = Some(FwdMerge::new(
+        self.inner.clone(),
+        self.part.clone(),
+        self.bounds.clone(),
+      )?);
     }
-    let lower = bound_as_slice(&self.bounds.lower);
-    let upper = bound_as_slice(&self.bounds.upper);
-    let pairs = self.inner.collect(&self.part, lower, upper)?;
-    let entries = pairs
-      .into_iter()
-      .map(|(key, value)| ObjectLsmEntry { key, value })
-      .collect();
-    self.mat = Some(Mat {
-      entries,
-      front: self.front_done,
-      back: self.back_done,
-    });
-    self.fwd = None;
-    self.back = None;
     Ok(())
   }
 
-  fn take_mat_front(&mut self) -> Option<Result<ObjectLsmEntry>> {
-    let m = self.mat.as_mut()?;
-    if m.front + m.back >= m.entries.len() {
-      return None;
+  fn ensure_back(&mut self) -> Result<()> {
+    if self.back.is_none() {
+      self.back = Some(BackMerge::new(
+        self.inner.clone(),
+        self.part.clone(),
+        self.bounds.clone(),
+      )?);
     }
-    let e = m.entries[m.front].clone();
-    m.front += 1;
-    Some(Ok(e))
-  }
-
-  fn take_mat_back(&mut self) -> Option<Result<ObjectLsmEntry>> {
-    let m = self.mat.as_mut()?;
-    if m.front + m.back >= m.entries.len() {
-      return None;
-    }
-    let idx = m.entries.len() - 1 - m.back;
-    let e = m.entries[idx].clone();
-    m.back += 1;
-    Some(Ok(e))
-  }
-}
-
-fn bound_as_slice(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
-  match b {
-    Bound::Included(x) => Bound::Included(x.as_slice()),
-    Bound::Excluded(x) => Bound::Excluded(x.as_slice()),
-    Bound::Unbounded => Bound::Unbounded,
+    Ok(())
   }
 }
 
@@ -147,35 +110,28 @@ impl Iterator for ObjectLsmIter {
     if let Some(e) = self.err.take() {
       return Some(Err(e));
     }
-    if self.mat.is_some() {
-      return self.take_mat_front();
+    if let Err(e) = self.ensure_fwd() {
+      self.err = Some(e.clone());
+      return Some(Err(e));
     }
-    self.front_used = true;
-    if self.back_used {
-      if let Err(e) = self.materialize() {
-        self.err = Some(e.clone());
-        return Some(Err(e));
-      }
-      return self.take_mat_front();
-    }
-    if self.fwd.is_none() {
-      match FwdMerge::new(self.inner.clone(), self.part.clone(), self.bounds.clone()) {
-        Ok(m) => self.fwd = Some(m),
+    loop {
+      match self.fwd.as_mut().unwrap().next() {
+        Ok(Some((key, value))) => {
+          // The backward cursor has already delivered every live key greater
+          // than or equal to its smallest delivered key.
+          if let Some(hi) = &self.back_watermark
+            && key.as_slice() >= hi.as_slice()
+          {
+            continue;
+          }
+          self.front_watermark = Some(key.clone());
+          return Some(Ok(ObjectLsmEntry { key, value }));
+        }
+        Ok(None) => return None,
         Err(e) => {
           self.err = Some(e.clone());
           return Some(Err(e));
         }
-      }
-    }
-    match self.fwd.as_mut().unwrap().next() {
-      Ok(Some((key, value))) => {
-        self.front_done += 1;
-        Some(Ok(ObjectLsmEntry { key, value }))
-      }
-      Ok(None) => None,
-      Err(e) => {
-        self.err = Some(e.clone());
-        Some(Err(e))
       }
     }
   }
@@ -186,35 +142,28 @@ impl DoubleEndedIterator for ObjectLsmIter {
     if let Some(e) = self.err.take() {
       return Some(Err(e));
     }
-    if self.mat.is_some() {
-      return self.take_mat_back();
+    if let Err(e) = self.ensure_back() {
+      self.err = Some(e.clone());
+      return Some(Err(e));
     }
-    self.back_used = true;
-    if self.front_used {
-      if let Err(e) = self.materialize() {
-        self.err = Some(e.clone());
-        return Some(Err(e));
-      }
-      return self.take_mat_back();
-    }
-    if self.back.is_none() {
-      match BackMerge::new(self.inner.clone(), self.part.clone(), self.bounds.clone()) {
-        Ok(m) => self.back = Some(m),
+    loop {
+      match self.back.as_mut().unwrap().next() {
+        Ok(Some((key, value))) => {
+          // The forward cursor has already delivered every live key less than
+          // or equal to its largest delivered key.
+          if let Some(lo) = &self.front_watermark
+            && key.as_slice() <= lo.as_slice()
+          {
+            continue;
+          }
+          self.back_watermark = Some(key.clone());
+          return Some(Ok(ObjectLsmEntry { key, value }));
+        }
+        Ok(None) => return None,
         Err(e) => {
           self.err = Some(e.clone());
           return Some(Err(e));
         }
-      }
-    }
-    match self.back.as_mut().unwrap().next() {
-      Ok(Some((key, value))) => {
-        self.back_done += 1;
-        Some(Ok(ObjectLsmEntry { key, value }))
-      }
-      Ok(None) => None,
-      Err(e) => {
-        self.err = Some(e.clone());
-        Some(Err(e))
       }
     }
   }

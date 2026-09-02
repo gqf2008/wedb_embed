@@ -34,6 +34,13 @@ pub struct Config {
   /// Upper bound of the in-memory pending journal buffer (bytes) before a
   /// synchronous flush is forced.
   pub journal_max_buffer_bytes: u64,
+  /// When `true` (default), replaced segment objects are deleted eagerly after
+  /// compaction, `clear_partition`, `rm_partition`, and startup GC. When
+  /// `false`, orphaned segment objects are intentionally left behind so an
+  /// external object-store lifecycle rule (for example Cloudflare R2 bucket
+  /// versioning + lifecycle) can reclaim them later. Reads and recovery are
+  /// unaffected; journal GC keeps its own separate policy.
+  pub eager_object_delete: bool,
 }
 
 impl Default for Config {
@@ -46,6 +53,7 @@ impl Default for Config {
       max_segments_before_compact: DEFAULT_MAX_SEGMENTS_BEFORE_COMPACT,
       journal_window_ms: None,
       journal_max_buffer_bytes: 1024 * 1024,
+      eager_object_delete: true,
     }
   }
 }
@@ -92,6 +100,16 @@ impl Config {
   /// Upper bound of the pending journal buffer before a synchronous flush.
   pub fn journal_max_buffer_bytes(mut self, bytes: u64) -> Self {
     self.journal_max_buffer_bytes = bytes;
+    self
+  }
+
+  /// Control whether replaced segment objects are deleted eagerly.
+  ///
+  /// Disable this when object-store lifecycle rules are responsible for
+  /// reclaiming orphaned segment objects; the engine then skips the per-object
+  /// `DELETE` calls after compaction / clear / rm / startup GC.
+  pub fn eager_object_delete(mut self, enabled: bool) -> Self {
+    self.eager_object_delete = enabled;
     self
   }
 

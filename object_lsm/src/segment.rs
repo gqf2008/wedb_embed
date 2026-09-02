@@ -43,7 +43,7 @@ pub struct Trailer {
 }
 
 /// One data block's location and its first key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMeta {
   /// Byte offset of the block (crc header) inside the object.
   pub offset: u32,
@@ -54,7 +54,7 @@ pub struct BlockMeta {
 }
 
 /// In-memory block index of one segment.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentIndex {
   pub blocks: Vec<BlockMeta>,
 }
@@ -79,6 +79,10 @@ pub struct SegmentMeta {
   /// Number of data blocks.
   #[serde(default)]
   pub blocks: u64,
+  /// Embedded block index loaded from the manifest (None for legacy manifests;
+  /// falls back to tail + index Range GETs).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub index: Option<SegmentIndex>,
 }
 
 /// Parse the fixed trailer from the last `TAIL_LEN` bytes of an object.
@@ -265,6 +269,7 @@ pub fn build_segment_meta(
     return Err(Error::Corrupt("segment index out of bounds".into()));
   }
   let index = decode_index(&encoded[idx_start..idx_end])?;
+  let blocks = index.blocks.len() as u64;
   let tombstones = entries.iter().filter(|(_, v)| v.is_none()).count() as u64;
   Ok(SegmentMeta {
     id,
@@ -274,7 +279,8 @@ pub fn build_segment_meta(
     count: tail.count,
     tombstones,
     bytes: encoded.len() as u64,
-    blocks: index.blocks.len() as u64,
+    blocks,
+    index: Some(index),
   })
 }
 

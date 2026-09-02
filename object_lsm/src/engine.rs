@@ -105,9 +105,9 @@ impl ObjectLsm {
   }
 
   fn build(store: Arc<dyn Store>, cfg: Config) -> Result<Self> {
-    let state = recover(&*store, &cfg)?;
     let block_cache = BlockCache::new(cfg.cache_capacity);
     let index_cache = IndexCache::default();
+    let state = recover(&*store, &cfg, &index_cache)?;
     let inner = Arc::new(Inner {
       store,
       state: RwLock::new(state),
@@ -139,7 +139,7 @@ impl Drop for ObjectLsm {
 
 /// Rebuild in-memory state from the durable manifest + journal tail, then run
 /// startup compaction/G C.
-fn recover(store: &dyn Store, cfg: &Config) -> Result<EngineState> {
+fn recover(store: &dyn Store, cfg: &Config, index_cache: &IndexCache) -> Result<EngineState> {
   let mut st = EngineState::new(cfg.clone());
   let prefix = &cfg.prefix;
 
@@ -158,6 +158,11 @@ fn recover(store: &dyn Store, cfg: &Config) -> Result<EngineState> {
     st.next_segment_id = man.next_segment_id;
     st.journal_seq = man.next_journal_seq;
     for (name, pm) in man.partitions {
+      for seg in &pm.segments {
+        if let Some(index) = &seg.index {
+          index_cache.insert(seg.id, Arc::new(index.clone()));
+        }
+      }
       st.partitions.insert(
         name.clone(),
         PartitionState {
@@ -344,10 +349,12 @@ fn read_segment_entries(
 
 /// Merge every segment of a partition into one fresh segment: read newest ->
 /// oldest, keep only the surviving values, drop tombstones only after all
-/// older segments have been folded in, publish, then delete the old objects.
+/// older segments have been folded in, publish, then (when eager deletion is
+/// enabled) delete the old objects.
 fn compact_partition_locked(store: &dyn Store, st: &mut EngineState, name: &str) -> Result<bool> {
   flush_partition(store, st, name)?;
   let prefix = st.cfg.prefix.clone();
+  let eager = st.cfg.eager_object_delete;
   let need = {
     let ps = st.partitions.get(name);
     matches!(ps, Some(p) if !p.dropped && p.segments.len() > 1)
@@ -386,8 +393,10 @@ fn compact_partition_locked(store: &dyn Store, st: &mut EngineState, name: &str)
   }
   ps.watermark = st.journal_seq;
   publish_manifest(store, st)?;
-  for seg in &old {
-    let _ = store.delete(&segment_key(&prefix, name, seg.id));
+  if eager {
+    for seg in &old {
+      let _ = store.delete(&segment_key(&prefix, name, seg.id));
+    }
   }
   st.compactions_completed += 1;
   Ok(true)
@@ -426,32 +435,36 @@ fn gc_journal(store: &dyn Store, st: &mut EngineState) {
   }
 }
 
-/// Startup GC: delete segment objects not referenced by the current manifest
-/// and manifest snapshots superseded by `current`.
+/// Startup GC: when eager deletion is enabled, delete segment objects not
+/// referenced by the current manifest; always delete manifest snapshots
+/// superseded by `current` (they are cheap metadata, not the high-volume
+/// segment DELETE path).
 fn gc_objects_at_open(store: &dyn Store, st: &mut EngineState) -> Result<()> {
   let prefix = st.cfg.prefix.clone();
-  let seg_root = segment_root(&prefix);
-  let seg_prefix = format!("{prefix}/seg/");
-  let live: BTreeMap<String, Vec<u64>> = st
-    .partitions
-    .iter()
-    .filter(|(_, p)| !p.dropped)
-    .map(|(name, p)| (name.clone(), p.segments.iter().map(|s| s.id).collect()))
-    .collect();
-  for key in store.list(&seg_root)? {
-    let rest = match key.strip_prefix(&seg_prefix) {
-      Some(r) => r,
-      None => continue,
-    };
-    let Some((part, id_s)) = rest.rsplit_once('/') else {
-      continue;
-    };
-    let Ok(id) = id_s.parse::<u64>() else {
-      continue;
-    };
-    let referenced = live.get(part).map(|ids| ids.contains(&id)).unwrap_or(false);
-    if !referenced {
-      let _ = store.delete(&key);
+  if st.cfg.eager_object_delete {
+    let seg_root = segment_root(&prefix);
+    let seg_prefix = format!("{prefix}/seg/");
+    let live: BTreeMap<String, Vec<u64>> = st
+      .partitions
+      .iter()
+      .filter(|(_, p)| !p.dropped)
+      .map(|(name, p)| (name.clone(), p.segments.iter().map(|s| s.id).collect()))
+      .collect();
+    for key in store.list(&seg_root)? {
+      let rest = match key.strip_prefix(&seg_prefix) {
+        Some(r) => r,
+        None => continue,
+      };
+      let Some((part, id_s)) = rest.rsplit_once('/') else {
+        continue;
+      };
+      let Ok(id) = id_s.parse::<u64>() else {
+        continue;
+      };
+      let referenced = live.get(part).map(|ids| ids.contains(&id)).unwrap_or(false);
+      if !referenced {
+        let _ = store.delete(&key);
+      }
     }
   }
   let cur = st.manifest_seq;
@@ -580,6 +593,11 @@ impl Inner {
     if let Some(idx) = self.index_cache.get(seg.id) {
       return Ok(idx);
     }
+    if let Some(idx) = &seg.index {
+      let idx = Arc::new(idx.clone());
+      self.index_cache.insert(seg.id, idx.clone());
+      return Ok(idx);
+    }
     let key = segment_key(prefix, part, seg.id);
     let tail_raw = self
       .store
@@ -665,55 +683,10 @@ impl Inner {
     Ok(None)
   }
 
-  /// Snapshot all live entries of a partition within `(lower, upper)`, sorted.
-  pub(crate) fn collect(
-    &self,
-    name: &str,
-    lower: std::ops::Bound<&[u8]>,
-    upper: std::ops::Bound<&[u8]>,
-  ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let st = self.state.read();
-    let prefix = st.cfg.prefix.clone();
-    let Some(ps) = st.partitions.get(name) else {
-      return Ok(Vec::new());
-    };
-    let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-    for (k, e) in &ps.mem {
-      if !in_bounds(k, lower, upper) {
-        continue;
-      }
-      let v = match e {
-        MemEntry::Value(v) => Some(v.clone()),
-        MemEntry::Tombstone => None,
-      };
-      map.insert(k.clone(), v);
-    }
-    for seg in ps.segments.iter().rev() {
-      if !seg_overlaps(seg, lower, upper) {
-        continue;
-      }
-      let index = self.load_index(&prefix, name, seg)?;
-      for block in &index.blocks {
-        let entries = self.load_block(&prefix, name, seg, block)?;
-        for (k, v) in entries.iter() {
-          if !in_bounds(k, lower, upper) {
-            continue;
-          }
-          map.entry(k.clone()).or_insert(v.clone());
-        }
-      }
-    }
-    Ok(
-      map
-        .into_iter()
-        .filter_map(|(k, v)| v.map(|val| (k, val)))
-        .collect(),
-    )
-  }
-
   pub(crate) fn clear_partition(&self, name: &str) -> Result<()> {
     let mut st = self.state.write();
     let prefix = st.cfg.prefix.clone();
+    let eager = st.cfg.eager_object_delete;
     let tail_seq = st.journal_seq;
     {
       let ps = match st.partitions.get_mut(name) {
@@ -721,7 +694,9 @@ impl Inner {
         None => return Ok(()),
       };
       for seg in ps.segments.drain(..) {
-        let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
+        if eager {
+          let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
+        }
         self.index_cache.remove(seg.id);
       }
       ps.mem.clear();
@@ -737,6 +712,7 @@ impl Inner {
   pub(crate) fn rm_partition(&self, name: &str) -> Result<()> {
     let mut st = self.state.write();
     let prefix = st.cfg.prefix.clone();
+    let eager = st.cfg.eager_object_delete;
     let tail_seq = st.journal_seq;
     {
       let ps = match st.partitions.get_mut(name) {
@@ -744,7 +720,9 @@ impl Inner {
         None => return Ok(()),
       };
       for seg in ps.segments.drain(..) {
-        let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
+        if eager {
+          let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
+        }
         self.index_cache.remove(seg.id);
       }
       ps.mem.clear();
@@ -780,38 +758,6 @@ impl Inner {
     gc_journal(&*self.store, &mut st);
     Ok(())
   }
-}
-
-fn in_bounds(k: &[u8], lower: std::ops::Bound<&[u8]>, upper: std::ops::Bound<&[u8]>) -> bool {
-  let lo = match lower {
-    std::ops::Bound::Included(x) => k >= x,
-    std::ops::Bound::Excluded(x) => k > x,
-    std::ops::Bound::Unbounded => true,
-  };
-  let hi = match upper {
-    std::ops::Bound::Included(x) => k <= x,
-    std::ops::Bound::Excluded(x) => k < x,
-    std::ops::Bound::Unbounded => true,
-  };
-  lo && hi
-}
-
-fn seg_overlaps(
-  seg: &SegmentMeta,
-  lower: std::ops::Bound<&[u8]>,
-  upper: std::ops::Bound<&[u8]>,
-) -> bool {
-  let lo_ok = match lower {
-    std::ops::Bound::Unbounded => true,
-    std::ops::Bound::Included(x) => seg.last.as_slice() >= x,
-    std::ops::Bound::Excluded(x) => seg.last.as_slice() > x,
-  };
-  let hi_ok = match upper {
-    std::ops::Bound::Unbounded => true,
-    std::ops::Bound::Included(x) => seg.first.as_slice() <= x,
-    std::ops::Bound::Excluded(x) => seg.first.as_slice() < x,
-  };
-  lo_ok && hi_ok
 }
 
 impl Engine for ObjectLsm {

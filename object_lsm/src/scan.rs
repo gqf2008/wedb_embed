@@ -5,9 +5,10 @@
 //! it actually reads. Duplicate keys across layers resolve newest-wins;
 //! tombstones suppress older copies without materializing anything.
 //!
-//! Pure forward and pure backward scans stream; a scan that mixes both
-//! directions falls back to a materialized snapshot in
-//! [`crate::partition::ObjectLsmIter`].
+//! Pure forward and pure backward scans stream. When both directions are used
+//! on one iterator, [`crate::partition::ObjectLsmIter`] keeps both streaming
+//! cursors and uses delivered-key watermarks to avoid producing the same key
+//! twice, so mixed-direction scans stay streaming as well.
 
 use std::{collections::BinaryHeap, sync::Arc};
 
