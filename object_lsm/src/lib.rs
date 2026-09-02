@@ -8,13 +8,14 @@
 //! - committed writes first land in a per-instance **journal** (immutable objects),
 //!   giving cross-partition atomic batches + crash-safe replay;
 //! - per-partition **memtables** absorb recent writes for µs-scale hot reads;
-//! - full memtables are flushed into immutable sorted **segment** objects;
+//! - full memtables are flushed into immutable **block-indexed segment** objects;
 //! - a small **manifest** object records live segments + per-partition watermark.
 //!
-//! M1 (current milestone): correct vertical slice over the in-memory [`Store`]
-//! implementation; remote R2/S3 backend and block-indexed segments follow in M2+.
+//! M2 (current milestone): block-indexed segment format, byte-range reads and
+//! block/index caches are in; ordered streaming iteration lands on top of them.
 
 pub mod batch;
+pub mod cache;
 pub mod codec;
 pub mod config;
 pub mod engine;
@@ -28,6 +29,7 @@ pub mod state;
 pub mod store;
 
 pub use batch::ObjectLsmBatch;
+pub use cache::{BlockCache, IndexCache};
 pub use config::Config;
 pub use engine::ObjectLsm;
 pub use error::{Error, Result};

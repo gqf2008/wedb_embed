@@ -208,3 +208,46 @@ fn disk_space_and_metrics() {
   assert!(db.disk_space().unwrap() > 0);
   assert!(db.write_buffer_size() <= 32);
 }
+
+#[test]
+fn multi_block_segment_reads_via_range() {
+  // One flush with many small blocks: point lookups and scans must hit the
+  // right block via the block index (Range GET path), not full-object reads.
+  let store = MemoryStore::new();
+  let cfg = Config::new("t/blocks")
+    .max_memtable_bytes(1 << 20)
+    .block_size(64);
+  let db = ObjectLsm::open(Arc::new(store.clone()), cfg).unwrap();
+  let p = db.partition("data").unwrap();
+  for i in 0..2000u32 {
+    p.insert(
+      format!("key{i:05}").as_bytes(),
+      format!("value-{i}").as_bytes(),
+    )
+    .unwrap();
+  }
+  db.compact().unwrap(); // single segment, many blocks
+  assert_eq!(p.table_count(), 1);
+  for i in (0..2000u32).step_by(13) {
+    assert_eq!(
+      p.get(format!("key{i:05}").as_bytes()).unwrap().unwrap(),
+      format!("value-{i}").as_bytes()
+    );
+  }
+  assert!(
+    db.cache_size() > 0,
+    "block cache should be populated by reads"
+  );
+  let prefixed: Vec<Vec<u8>> = p
+    .prefix(b"key01")
+    .map(|e| e.unwrap().key().to_vec())
+    .collect();
+  assert_eq!(prefixed.len(), 1000);
+  assert_eq!(prefixed.first().unwrap(), b"key01000");
+  drop(db);
+
+  let db2 = reopen(&store, "t/blocks", 1 << 20);
+  let p2 = db2.partition("data").unwrap();
+  assert_eq!(p2.get(b"key01999").unwrap().unwrap(), b"value-1999");
+  assert_eq!(p2.len().unwrap(), 2000);
+}

@@ -1,5 +1,5 @@
 //! Engine implementation: open/recovery, commit pipeline, segment flush,
-//! manifest publishing and the [`Engine`] trait impl.
+//! manifest publishing, block/range read path and the [`Engine`] trait impl.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -8,13 +8,17 @@ use wedb_embed_engine::Engine;
 
 use crate::{
   batch::ObjectLsmBatch,
+  cache::{BlockCache, IndexCache},
   config::Config,
   error::{Error, Result},
   journal::{Group, Op, decode_group, encode_group},
   keys::{current_key, journal_key, journal_prefix, manifest_key, parse_tail_seq, segment_key},
   manifest::{Manifest, PartitionMeta},
   partition::ObjectLsmPartition,
-  segment::{SegmentMeta, decode_segment, encode_segment, meta_for},
+  segment::{
+    BLOCK_HEADER_LEN, BlockMeta, SegmentEntries, SegmentIndex, SegmentMeta, TAIL_LEN,
+    build_segment_meta, decode_block, decode_index, encode_segment, find_block, parse_tail,
+  },
   state::{EngineState, MemEntry, PartitionState},
   store::Store,
 };
@@ -23,6 +27,8 @@ use crate::{
 pub struct Inner {
   pub store: Arc<dyn Store>,
   pub state: RwLock<EngineState>,
+  pub block_cache: BlockCache,
+  pub index_cache: IndexCache,
 }
 
 /// Object-storage-backed LSM engine implementing the wedb_embed_engine traits.
@@ -30,8 +36,8 @@ pub struct Inner {
 /// # Consistency model (M1)
 /// - every [`Batch`] commit first uploads one immutable journal group object
 ///   (the atomic durability point), then applies the group to memtables;
-/// - memtables spill into immutable sorted segment objects once they exceed
-///   `Config::max_memtable_bytes`;
+/// - memtables spill into immutable block-indexed segment objects once they
+///   exceed `Config::max_memtable_bytes`;
 /// - a single manifest object chain records live segments + per-partition
 ///   journal watermarks;
 /// - opening re-reads `current -> manifest` and replays journal groups newer
@@ -55,10 +61,14 @@ impl ObjectLsm {
   /// Open (or create) an engine instance in `store` under `cfg.prefix`.
   pub fn open(store: Arc<dyn Store>, cfg: Config) -> Result<Self> {
     let state = recover(&*store, &cfg)?;
+    let block_cache = BlockCache::new(cfg.cache_capacity);
+    let index_cache = IndexCache::default();
     Ok(Self {
       inner: Arc::new(Inner {
         store,
         state: RwLock::new(state),
+        block_cache,
+        index_cache,
       }),
     })
   }
@@ -178,7 +188,7 @@ fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
   Ok(())
 }
 
-/// Flush one partition's memtable into an immutable segment object and
+/// Flush one partition's memtable into an immutable block-indexed segment and
 /// advance its watermark.
 fn flush_partition(store: &dyn Store, st: &mut EngineState, name: &str) -> Result<()> {
   {
@@ -189,7 +199,7 @@ fn flush_partition(store: &dyn Store, st: &mut EngineState, name: &str) -> Resul
     if ps.mem.is_empty() {
       return Ok(());
     }
-    let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = ps
+    let entries: SegmentEntries = ps
       .mem
       .iter()
       .map(|(k, e)| {
@@ -200,11 +210,11 @@ fn flush_partition(store: &dyn Store, st: &mut EngineState, name: &str) -> Resul
         (k.clone(), v)
       })
       .collect();
-    let encoded = encode_segment(&entries)?;
+    let encoded = encode_segment(&entries, st.cfg.block_size as usize)?;
     let id = st.next_segment_id;
     st.next_segment_id += 1;
     store.put(&segment_key(&st.cfg.prefix, name, id), &encoded)?;
-    let meta = meta_for(id, st.journal_seq, &encoded, &entries);
+    let meta = build_segment_meta(id, st.journal_seq, &encoded, &entries)?;
     ps.segments.push(meta);
     ps.watermark = st.journal_seq;
     ps.mem.clear();
@@ -263,9 +273,66 @@ impl Inner {
     Ok(())
   }
 
-  /// Point lookup: memtable, then segments newest -> oldest.
+  /// Load (and cache) the block index of a segment via tail + index Range GETs.
+  fn load_index(&self, prefix: &str, part: &str, seg: &SegmentMeta) -> Result<Arc<SegmentIndex>> {
+    if let Some(idx) = self.index_cache.get(seg.id) {
+      return Ok(idx);
+    }
+    let key = segment_key(prefix, part, seg.id);
+    let tail_raw = self
+      .store
+      .get_range(
+        &key,
+        seg.bytes.saturating_sub(TAIL_LEN as u64),
+        TAIL_LEN as u64,
+      )?
+      .ok_or_else(|| Error::Corrupt(format!("segment {} tail missing", seg.id)))?;
+    let tail = parse_tail(&tail_raw)?;
+    let idx_raw = self
+      .store
+      .get_range(&key, tail.index_offset as u64, tail.index_len as u64)?
+      .ok_or_else(|| Error::Corrupt(format!("segment {} index missing", seg.id)))?;
+    let index = Arc::new(decode_index(&idx_raw)?);
+    self.index_cache.insert(seg.id, index.clone());
+    Ok(index)
+  }
+
+  /// Load (and cache) one decoded block of a segment via a Range GET.
+  fn load_block(
+    &self,
+    prefix: &str,
+    part: &str,
+    seg: &SegmentMeta,
+    block: &BlockMeta,
+  ) -> Result<Arc<SegmentEntries>> {
+    if let Some(entries) = self.block_cache.get(seg.id, block.offset) {
+      return Ok(entries);
+    }
+    let key = segment_key(prefix, part, seg.id);
+    let raw = self
+      .store
+      .get_range(&key, block.offset as u64, block.len as u64)?
+      .ok_or_else(|| {
+        Error::Corrupt(format!(
+          "segment {} block @{} missing",
+          seg.id, block.offset
+        ))
+      })?;
+    if raw.len() < BLOCK_HEADER_LEN {
+      return Err(Error::Corrupt("block shorter than header".into()));
+    }
+    let entries = Arc::new(decode_block(&raw)?);
+    self
+      .block_cache
+      .insert(seg.id, block.offset, entries.clone(), block.len as u64);
+    Ok(entries)
+  }
+
+  /// Point lookup: memtable, then segments newest -> oldest using the block
+  /// index to fetch only the candidate block.
   pub(crate) fn lookup(&self, name: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
     let st = self.state.read();
+    let prefix = st.cfg.prefix.clone();
     let Some(ps) = st.partitions.get(name) else {
       return Ok(None);
     };
@@ -279,11 +346,12 @@ impl Inner {
       if seg.first.as_slice() > key || seg.last.as_slice() < key {
         continue;
       }
-      let bytes = self
-        .store
-        .get(&segment_key(&st.cfg.prefix, name, seg.id))?
-        .ok_or_else(|| Error::Corrupt(format!("segment {} missing", seg.id)))?;
-      let entries = decode_segment(&bytes)?;
+      let index = self.load_index(&prefix, name, seg)?;
+      let Some(bi) = find_block(&index, key) else {
+        continue;
+      };
+      let block = &index.blocks[bi];
+      let entries = self.load_block(&prefix, name, seg, block)?;
       let idx = entries.partition_point(|(k, _)| k.as_slice() < key);
       if let Some((_, v)) = entries.get(idx) {
         // A tombstone here shadows any older segment value.
@@ -301,6 +369,7 @@ impl Inner {
     upper: std::ops::Bound<&[u8]>,
   ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let st = self.state.read();
+    let prefix = st.cfg.prefix.clone();
     let Some(ps) = st.partitions.get(name) else {
       return Ok(Vec::new());
     };
@@ -319,16 +388,15 @@ impl Inner {
       if !seg_overlaps(seg, lower, upper) {
         continue;
       }
-      let bytes = self
-        .store
-        .get(&segment_key(&st.cfg.prefix, name, seg.id))?
-        .ok_or_else(|| Error::Corrupt(format!("segment {} missing", seg.id)))?;
-      let entries = decode_segment(&bytes)?;
-      for (k, v) in entries {
-        if !in_bounds(&k, lower, upper) {
-          continue;
+      let index = self.load_index(&prefix, name, seg)?;
+      for block in &index.blocks {
+        let entries = self.load_block(&prefix, name, seg, block)?;
+        for (k, v) in entries.iter() {
+          if !in_bounds(k, lower, upper) {
+            continue;
+          }
+          map.entry(k.clone()).or_insert(v.clone());
         }
-        map.entry(k).or_insert(v);
       }
     }
     Ok(
@@ -350,6 +418,7 @@ impl Inner {
       };
       for seg in ps.segments.drain(..) {
         let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
+        self.index_cache.remove(seg.id);
       }
       ps.mem.clear();
       ps.mem_bytes = 0;
@@ -370,6 +439,7 @@ impl Inner {
       };
       for seg in ps.segments.drain(..) {
         let _ = self.store.delete(&segment_key(&prefix, name, seg.id));
+        self.index_cache.remove(seg.id);
       }
       ps.mem.clear();
       ps.mem_bytes = 0;
@@ -482,6 +552,14 @@ impl Engine for ObjectLsm {
       .values()
       .map(|p| p.mem_bytes)
       .sum()
+  }
+
+  fn cache_size(&self) -> u64 {
+    self.inner.block_cache.used()
+  }
+
+  fn cache_capacity(&self) -> u64 {
+    self.inner.block_cache.capacity()
   }
 
   fn batch(&self) -> Self::Batch {

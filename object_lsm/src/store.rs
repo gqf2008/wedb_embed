@@ -15,6 +15,11 @@ pub trait Store: Send + Sync + 'static {
   /// Fetch an object; `None` when the key does not exist.
   fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
+  /// Fetch a byte range `[offset, offset + len)` of an object; `None` when the
+  /// key does not exist. Reads past the end return the available tail bytes
+  /// (matching S3 Range GET semantics).
+  fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>>;
+
   /// Atomically create or overwrite an object.
   fn put(&self, key: &str, data: &[u8]) -> Result<()>;
 
@@ -46,6 +51,16 @@ impl MemoryStore {
 impl Store for MemoryStore {
   fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
     Ok(self.inner.lock().unwrap().objects.get(key).cloned())
+  }
+
+  fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+    let g = self.inner.lock().unwrap();
+    let Some(obj) = g.objects.get(key) else {
+      return Ok(None);
+    };
+    let start = (offset as usize).min(obj.len());
+    let end = start.saturating_add(len as usize).min(obj.len());
+    Ok(Some(obj[start..end].to_vec()))
   }
 
   fn put(&self, key: &str, data: &[u8]) -> Result<()> {
