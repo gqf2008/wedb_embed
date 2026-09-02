@@ -2768,6 +2768,7 @@ dependencies = [
  "crc32fast",
  "divan",
  "futures-util",
+ "md-5",
  "object_store",
  "parking_lot",
  "serde",

@@ -2,7 +2,7 @@
 
 use std::{
   sync::{
-    Arc,
+    Arc, Barrier,
     atomic::{AtomicBool, Ordering},
   },
   thread,
@@ -171,4 +171,70 @@ fn lost_lease_blocks_writes() {
       }
     }
   }
+}
+
+#[test]
+fn three_way_stale_takeover_yields_single_owner() {
+  let store = MemoryStore::new();
+  let prefix = "rf/three";
+  store.put(&lease_key(prefix), b"old-owner\n1").unwrap(); // expired long ago
+
+  let opts = |owner: &str| LeaseOptions {
+    owner: owner.to_string(),
+    ttl: Duration::from_secs(30),
+    timeout: Duration::from_millis(900),
+    heartbeat: false,
+  };
+
+  let barrier = Arc::new(Barrier::new(3));
+  let mut handles = Vec::new();
+  for i in 0..3 {
+    let s = Arc::new(store.clone());
+    let b = barrier.clone();
+    let owner = format!("w{i}");
+    handles.push(thread::spawn(move || {
+      b.wait();
+      // Keep the Lease alive: dropping it would release (delete) the record.
+      Lease::acquire(s, prefix, opts(&owner))
+    }));
+  }
+
+  let mut winners = 0;
+  let mut losers = 0;
+  let mut held = Vec::new();
+  for h in handles {
+    match h.join().unwrap() {
+      Ok(lease) => {
+        winners += 1;
+        held.push(lease);
+      }
+      Err(_) => losers += 1,
+    }
+  }
+  assert_eq!(
+    winners, 1,
+    "exactly one contender must win with CAS takeover"
+  );
+  assert_eq!(losers, 2);
+
+  let bytes = store
+    .get(&lease_key(prefix))
+    .unwrap()
+    .expect("lease present");
+  let owner = String::from_utf8(bytes)
+    .unwrap()
+    .split_once('\n')
+    .unwrap()
+    .0
+    .to_string();
+  assert!(owner == "w0" || owner == "w1" || owner == "w2");
+}
+
+#[test]
+fn memory_cas_sanity() {
+  let s = MemoryStore::new();
+  s.put("cas/k", b"a").unwrap();
+  assert!(s.put_if_matches("cas/k", b"a", b"b").unwrap());
+  assert!(!s.put_if_matches("cas/k", b"a", b"c").unwrap());
+  assert_eq!(s.get("cas/k").unwrap().unwrap(), b"b");
 }

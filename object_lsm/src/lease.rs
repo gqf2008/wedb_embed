@@ -120,11 +120,14 @@ impl Lease {
           }
         }
         Ok(Some(bytes)) => {
-          // Steal a lease that has already expired.
+          // Atomically take over an expired lease with compare-and-swap: it
+          // only succeeds if the object still holds the exact expired payload
+          // we just read, so two contenders cannot both win.
           if let Ok((_, expiry)) = parse_payload(&bytes)
             && expiry <= now_ms()
+            && store.put_if_matches(&key, &bytes, &payload(&opts.owner, ttl_ms))?
           {
-            let _ = store.delete(&key);
+            break;
           }
         }
         Err(e) => return Err(e),
@@ -183,11 +186,15 @@ impl Lease {
           self.inner.lost.store(true, Ordering::SeqCst);
           return Ok(false);
         }
-        store.put(
+        let renewed = store.put_if_matches(
           &self.inner.key,
+          &bytes,
           &payload(&self.inner.owner, self.inner.ttl_ms),
         )?;
-        Ok(true)
+        if !renewed {
+          self.inner.lost.store(true, Ordering::SeqCst);
+        }
+        Ok(renewed)
       }
     }
   }
@@ -235,8 +242,8 @@ fn spawn_heartbeat(inner: Arc<LeaseInner>, stop_rx: std::sync::mpsc::Receiver<()
           Ok(Some(bytes)) => match parse_payload(&bytes) {
             Ok((owner, _)) if owner == inner.owner => inner
               .store
-              .put(&inner.key, &payload(&inner.owner, inner.ttl_ms))
-              .is_ok(),
+              .put_if_matches(&inner.key, &bytes, &payload(&inner.owner, inner.ttl_ms))
+              .unwrap_or(false),
             _ => false,
           },
           _ => false,

@@ -5,8 +5,10 @@
 
 use std::{ops::Range, sync::Arc};
 
+use md5::{Digest, Md5};
 use object_store::{
-  ObjectStore, PutMode, PutOptions, PutPayload, aws::AmazonS3Builder, path::Path as ObjPath,
+  ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, aws::AmazonS3Builder,
+  path::Path as ObjPath,
 };
 use tokio::runtime::Runtime;
 
@@ -136,6 +138,36 @@ impl Store for R2Store {
         .await
         .map(|_| ())
         .map_err(Self::obj_err)
+    })
+  }
+
+  fn put_if_matches(&self, key: &str, expected: &[u8], new: &[u8]) -> Result<bool> {
+    // R2/S3 single-part object ETag is the quoted MD5 of the payload, so a
+    // byte-level compare-and-swap maps to If-Match.
+    let etag = format!("{:x}", Md5::digest(expected));
+    let mode = PutMode::Update(UpdateVersion {
+      e_tag: Some(etag),
+      version: None,
+    });
+    let p = path(key)?;
+    let inner = self.inner.clone();
+    let payload = PutPayload::from(new.to_vec());
+    self.block(async move {
+      match inner
+        .put_opts(
+          &p,
+          payload,
+          PutOptions {
+            mode,
+            ..Default::default()
+          },
+        )
+        .await
+      {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::Precondition { .. }) => Ok(false),
+        Err(e) => Err(Self::obj_err(e)),
+      }
     })
   }
 

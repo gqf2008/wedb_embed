@@ -120,12 +120,13 @@ ObjectLsm::open_leased(store.clone(), cfg0, lease("w0"))?; // independent writer
 ObjectLsm::open_leased(store.clone(), cfg1, lease("w1"))?;
 ```
 
-Notes: leases are cooperative (best-effort fencing). A stale-lease takeover is
-not strictly single-writer under object stores that lack a conditional delete;
-it is narrowed with an ownership re-check after create but cannot be made
-airtight without compare-and-delete / conditional-write support. Each shard is
-a separate engine instance — cross-shard queries/cluster routing stay an
-application concern (as in Redis Cluster).
+Notes: stale-lease takeover and renewal use an atomic compare-and-swap
+(`Store::put_if_matches`): the lease is replaced only if its current payload is
+unchanged. `MemoryStore` compares bytes directly; `R2Store` maps it to S3
+`If-Match` using the single-part object ETag (MD5). Lost-lease detection is
+still best-effort heartbeat-based. Each shard is a separate engine instance —
+cross-shard queries/cluster routing stay an application concern (as in Redis
+Cluster).
 
 
 ## fjall-alignment notes
@@ -140,4 +141,5 @@ application concern (as in Redis Cluster).
 - dropping the engine (windowed group-commit) flushes the pending journal
   before stopping the background flusher, so a clean shutdown does not lose
   acknowledged writes.
+
 

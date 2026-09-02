@@ -34,6 +34,12 @@ pub trait Store: Send + Sync + 'static {
     Err(Error::store("create-if-absent not supported by this store"))
   }
 
+  /// Atomically replace an object only if its current content equals
+  /// `expected`; returns whether the replacement happened (compare-and-swap).
+  fn put_if_matches(&self, _key: &str, _expected: &[u8], _new: &[u8]) -> Result<bool> {
+    Err(Error::store("compare-and-swap not supported by this store"))
+  }
+
   /// List object keys under `prefix` in lexicographic order.
   fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -93,6 +99,21 @@ impl Store for MemoryStore {
     } else {
       g.objects.insert(key.to_string(), data.to_vec());
       Ok(true)
+    }
+  }
+
+  fn put_if_matches(&self, key: &str, expected: &[u8], new: &[u8]) -> Result<bool> {
+    let mut g = self.inner.lock().unwrap();
+    if g
+      .objects
+      .get(key)
+      .map(|v| v.as_slice() == expected)
+      .unwrap_or(false)
+    {
+      g.objects.insert(key.to_string(), new.to_vec());
+      Ok(true)
+    } else {
+      Ok(false)
     }
   }
 

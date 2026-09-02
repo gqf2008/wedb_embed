@@ -21,12 +21,13 @@ thiserror = "2"
 wedb_embed = { path = "../embed", optional = true }
 object_store = { version = "0.11", default-features = false, features = ["aws"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+md-5 = { version = "0.10", optional = true }
 futures-util = { version = "0.3", optional = true }
 
 [features]
 default = []
 wedb = ["dep:wedb_embed"]
-r2 = ["dep:object_store", "dep:tokio", "dep:futures-util"]
+r2 = ["dep:object_store", "dep:tokio", "dep:futures-util", "dep:md-5"]
 
 [dev-dependencies]
 divan = "0.1.21"
@@ -45,3 +46,4 @@ harness = false
 name = "bench_remote"
 harness = false
 required-features = ["r2", "wedb"]
+
