@@ -72,3 +72,24 @@ cargo test -p wedb_object_lsm --features r2 --test r2   # live roundtrip; skips 
 
 
 
+
+## Backend comparison benchmark (R2 vs fjall local)
+
+```sh
+cargo bench -p wedb_object_lsm --features "r2 wedb" --bench bench_remote
+# R2_* env required for the R2 rows; without them only local backends run
+# BENCH_N overrides the key count (default 200)
+```
+
+Observed (Cloudflare R2 public internet from CN, n=120, per-op):
+
+| backend | insert (commit) | point read (warm) | scan (warm) |
+| --- | --- | --- | --- |
+| fjall (local disk) | ~1 µs | ~0.3 µs | ~0.3 µs |
+| objectlsm (memory) | ~1 µs | ~0.5 µs | ~0.2 µs |
+| objectlsm (R2) | ~0.3 s (per-commit PUT) | ~9 ms (Range GET) | µs (block-cache warm) |
+
+The R2 write cost is dominated by the per-commit journal object PUT. The next
+engineering lever is group-commit journal batching (amortize many commits into
+one PUT) plus larger segments, which is where ObjectLsm's S3 story gets its
+throughput back on real object stores.

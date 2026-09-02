@@ -40,3 +40,8 @@ harness = false
 
 
 
+
+[[bench]]
+name = "bench_remote"
+harness = false
+required-features = ["r2", "wedb"]
