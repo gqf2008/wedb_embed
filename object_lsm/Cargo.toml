@@ -1,0 +1,23 @@
+[package]
+name = "wedb_object_lsm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+description = "Object-storage-backed LSM storage engine implementing wedb_embed_engine traits / 基于对象存储(S3/R2/MinIO)的 LSM 存储引擎，实现 wedb_embed_engine 通用 Trait"
+keywords = ["database", "storage-engine", "lsm-tree", "s3", "object-storage", "r2"]
+categories = ["database-implementations", "data-structures", "embedded"]
+
+[dependencies]
+wedb_embed_engine = { path = "../engine" }
+crc32fast = "1.4"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
