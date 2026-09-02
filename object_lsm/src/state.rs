@@ -223,6 +223,10 @@ pub struct EngineState {
   pub next_segment_id: u64,
   /// Journal object end-seqs whose objects still exist (maintained for GC).
   pub journal_seqs: BTreeSet<u64>,
+  /// Byte size of each live journal object (end seq -> bytes).
+  pub journal_sizes: BTreeMap<u64, u64>,
+  /// Byte size of the latest manifest snapshot.
+  pub manifest_bytes: u64,
   /// Encoded groups waiting for group-commit flush (windowed mode).
   pub pending: Vec<u8>,
   /// First seq present in `pending` (0 when empty).
@@ -240,6 +244,8 @@ impl EngineState {
       manifest_seq: 0,
       next_segment_id: 0,
       journal_seqs: BTreeSet::new(),
+      journal_sizes: BTreeMap::new(),
+      manifest_bytes: 0,
       compactions_completed: 0,
       pending: Vec::new(),
       pending_lo: 0,

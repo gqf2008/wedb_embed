@@ -78,3 +78,22 @@ fn prefix_with_trailing_ff_returns_only_matching_keys() {
   want.sort();
   assert_eq!(got, want, "prefix ending in 0xFF must not leak b/c keys");
 }
+
+#[test]
+fn disk_space_includes_journal_and_manifest() {
+  let store = MemoryStore::new();
+  let cfg = Config::new("rel/disk")
+    .max_memtable_bytes(1 << 20)
+    .journal_window_ms(Some(60_000));
+  let db = ObjectLsm::open(Arc::new(store), cfg).unwrap();
+  let p = db.partition("data").unwrap();
+  for i in 0..10u32 {
+    p.insert(format!("k{i}").as_bytes(), b"v").unwrap();
+  }
+  db.persist().unwrap(); // flush pending journal (memtable not yet flushed)
+  assert!(
+    db.journal_disk_space().unwrap() > 0,
+    "journal object should be counted"
+  );
+  assert!(db.disk_space().unwrap() > 0);
+}

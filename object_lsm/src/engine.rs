@@ -231,6 +231,7 @@ fn recover(
     let Some(bytes) = store.get(&journal_key(prefix, s))? else {
       continue;
     };
+    st.journal_sizes.insert(s, bytes.len() as u64);
     for group in decode_group_stream(&bytes)? {
       apply_group_recover(&mut st, &group, partitions)?;
     }
@@ -300,6 +301,7 @@ fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
   }
   st.manifest_seq = man.seq;
   let bytes = man.encode()?;
+  st.manifest_bytes = bytes.len() as u64;
   store.put(&manifest_key(&st.cfg.prefix, man.seq), &bytes)?;
   store.put(&current_key(&st.cfg.prefix), man.seq.to_string().as_bytes())?;
   Ok(())
@@ -476,6 +478,7 @@ fn gc_journal(store: &dyn Store, st: &mut EngineState) {
   for s in doomed {
     let _ = store.delete(&journal_key(&st.cfg.prefix, s));
     st.journal_seqs.remove(&s);
+    st.journal_sizes.remove(&s);
   }
 }
 
@@ -529,8 +532,10 @@ fn flush_journal_pending(store: &dyn Store, st: &mut EngineState) -> Result<()> 
     return Ok(());
   }
   let end = st.journal_seq;
+  let bytes = st.pending.len() as u64;
   store.put(&journal_key(&st.cfg.prefix, end), &st.pending)?;
   st.journal_seqs.insert(end);
+  st.journal_sizes.insert(end, bytes);
   st.pending.clear();
   st.pending_lo = 0;
   Ok(())
@@ -665,6 +670,7 @@ impl Inner {
       }
       let mut st = self.state.write();
       st.journal_seqs.insert(group.seq);
+      st.journal_sizes.insert(group.seq, bytes.len() as u64);
     }
 
     for op in &group.ops {
@@ -1015,6 +1021,11 @@ impl Engine for ObjectLsm {
     self.inner.state.read().journal_seqs.len()
   }
 
+  fn journal_disk_space(&self) -> Result<u64> {
+    let st = self.inner.state.read();
+    Ok(st.journal_sizes.values().copied().sum())
+  }
+
   fn cache_size(&self) -> u64 {
     self.inner.block_cache.used()
   }
@@ -1048,18 +1059,18 @@ impl Engine for ObjectLsm {
   }
 
   fn disk_space(&self) -> Result<u64> {
-    Ok(
-      self
-        .inner
-        .partitions
-        .snapshot()
-        .iter()
-        .map(|lock| {
-          let ps = lock.read();
-          ps.meta.segments.iter().map(|s| s.bytes).sum::<u64>() + ps.mem_bytes
-        })
-        .sum(),
-    )
+    let segments_mem: u64 = self
+      .inner
+      .partitions
+      .snapshot()
+      .iter()
+      .map(|lock| {
+        let ps = lock.read();
+        ps.meta.segments.iter().map(|s| s.bytes).sum::<u64>() + ps.mem_bytes
+      })
+      .sum();
+    let st = self.inner.state.read();
+    Ok(segments_mem + st.journal_sizes.values().copied().sum::<u64>() + st.manifest_bytes)
   }
 
   fn compact(&self) -> Result<()> {
