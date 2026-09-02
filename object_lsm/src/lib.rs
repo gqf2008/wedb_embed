@@ -13,7 +13,8 @@
 //!
 //! M2 done: block-indexed segments, byte-range reads, block/index caches and
 //! ordered streaming iteration. M3 done: merge compaction, journal GC and
-//! orphan GC at open. Next: M4 compatibility harness + R2 remote Store.
+//! orphan GC at open. M4 done: wedb_embed parity harness + benchmarks.
+//! Next: R2/S3 remote Store backend.
 
 pub mod batch;
 pub mod cache;
@@ -37,4 +38,13 @@ pub use engine::ObjectLsm;
 pub use error::{Error, Result};
 pub use partition::{ObjectLsmEntry, ObjectLsmIter, ObjectLsmPartition};
 pub use store::{MemoryStore, Store};
+
+/// Bridge so `wedb_embed` can use this engine as a backend
+/// (`wedb_embed::Error: From<E::Error>` bound on its `Db` methods).
+#[cfg(feature = "wedb")]
+impl From<Error> for wedb_embed::Error {
+  fn from(e: Error) -> Self {
+    wedb_embed::Error::engine(e.to_string())
+  }
+}
 

@@ -28,16 +28,16 @@ pub struct Bounds {
 pub fn ge_lower(k: &[u8], lower: &std::ops::Bound<Vec<u8>>) -> bool {
   match lower {
     std::ops::Bound::Unbounded => true,
-    std::ops::Bound::Included(x) => k >= x,
-    std::ops::Bound::Excluded(x) => k > x,
+    std::ops::Bound::Included(x) => k >= x.as_slice(),
+    std::ops::Bound::Excluded(x) => k > x.as_slice(),
   }
 }
 
 pub fn gt_upper(k: &[u8], upper: &std::ops::Bound<Vec<u8>>) -> bool {
   match upper {
     std::ops::Bound::Unbounded => false,
-    std::ops::Bound::Included(x) => k > x,
-    std::ops::Bound::Excluded(x) => k >= x,
+    std::ops::Bound::Included(x) => k > x.as_slice(),
+    std::ops::Bound::Excluded(x) => k >= x.as_slice(),
   }
 }
 
@@ -45,8 +45,8 @@ pub fn gt_upper(k: &[u8], upper: &std::ops::Bound<Vec<u8>>) -> bool {
 fn max_below_lower(max: &[u8], lower: &std::ops::Bound<Vec<u8>>) -> bool {
   match lower {
     std::ops::Bound::Unbounded => false,
-    std::ops::Bound::Included(x) => max < x,
-    std::ops::Bound::Excluded(x) => max <= x,
+    std::ops::Bound::Included(x) => max < x.as_slice(),
+    std::ops::Bound::Excluded(x) => max <= x.as_slice(),
   }
 }
 
@@ -62,13 +62,13 @@ fn block_max(index: &SegmentIndex, seg: &SegmentMeta, i: usize) -> Vec<u8> {
 fn seg_overlaps(seg: &SegmentMeta, b: &Bounds) -> bool {
   let lo_ok = match &b.lower {
     std::ops::Bound::Unbounded => true,
-    std::ops::Bound::Included(x) => seg.last.as_slice() >= x,
-    std::ops::Bound::Excluded(x) => seg.last.as_slice() > x,
+    std::ops::Bound::Included(x) => seg.last.as_slice() >= x.as_slice(),
+    std::ops::Bound::Excluded(x) => seg.last.as_slice() > x.as_slice(),
   };
   let hi_ok = match &b.upper {
     std::ops::Bound::Unbounded => true,
-    std::ops::Bound::Included(x) => seg.first.as_slice() <= x,
-    std::ops::Bound::Excluded(x) => seg.first.as_slice() < x,
+    std::ops::Bound::Included(x) => seg.first.as_slice() <= x.as_slice(),
+    std::ops::Bound::Excluded(x) => seg.first.as_slice() < x.as_slice(),
   };
   lo_ok && hi_ok
 }

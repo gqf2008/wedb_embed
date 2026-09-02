@@ -39,13 +39,22 @@ write-adjacent maintenance:
 - [x] M1 vertical slice: memtable/journal/segment/manifest, recovery, Engine impl
 - [x] M2 ordered streaming iteration, block-indexed segments + block cache
 - [x] M3 compaction + orphan GC + journal GC
-- [ ] M4 compatibility harness vs `wedb_embed` tests + benchmarks
+- [x] M4 compatibility harness vs `wedb_embed` tests + benchmarks
 - [ ] R2/S3 remote `Store` backend (feature-gated, needs credentials)
 
 ## Test
 
 ```sh
-cargo test -p wedb_object_lsm
+cargo test -p wedb_object_lsm              # engine tests (21)
+cargo test -p wedb_object_lsm --features wedb   # + wedb_embed parity harness (23)
+cargo bench -p wedb_object_lsm             # point read / scan / insert benches
 ```
+
+The `wedb` feature adds an optional `wedb_embed` backend bridge plus the M4
+compatibility harness: identical Redis-style scripts (string/hash/list/set/
+zset/bitmap/stream + cross-type errors + namespaces) run against both `Fjall`
+(reference) and `ObjectLsm`, asserting byte-identical result logs, and a
+reopen-persistence test for `ObjectLsm`.
+
 
 
