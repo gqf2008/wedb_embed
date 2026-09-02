@@ -12,7 +12,7 @@ use std::{
   time::Duration,
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use wedb_embed_engine::Engine;
 
 use crate::{
@@ -40,6 +40,9 @@ use crate::{
 pub struct Inner {
   pub store: Arc<dyn Store>,
   pub state: RwLock<EngineState>,
+  /// Serializes journal object PUTs so they never race while the global lock
+  /// is free for partition/flush work (strict mode commits PUT outside `state`).
+  pub journal_lock: Mutex<()>,
   /// Per-partition data-plane lock table (independent of `state`'s lock).
   pub partitions: PartitionTable,
   pub block_cache: BlockCache,
@@ -114,6 +117,7 @@ impl ObjectLsm {
     let inner = Arc::new(Inner {
       store,
       state: RwLock::new(state),
+      journal_lock: Mutex::new(()),
       partitions,
       block_cache,
       index_cache,
@@ -572,23 +576,41 @@ impl Inner {
       );
     }
 
-    let group = {
+    // Allocate the journal seq and (in windowed mode) append to the pending
+    // buffer under the global lock. In strict mode the group is serialized
+    // here but its object PUT happens afterwards outside the global lock, so a
+    // network write no longer blocks unrelated partition reads/writes.
+    let (group, strict_put) = {
       let mut st = self.state.write();
       let seq = st.journal_seq + 1;
       st.journal_seq = seq;
       let group = Group { seq, ops };
       let bytes = encode_group(&group)?;
-      if st.pending.is_empty() {
-        st.pending_lo = seq;
-      }
-      st.pending.extend_from_slice(&bytes);
-      if st.cfg.journal_window_ms.is_none()
-        || st.pending.len() as u64 >= st.cfg.journal_max_buffer_bytes
-      {
-        flush_journal_pending(&*self.store, &mut st)?;
-      }
-      group
+      let strict_put = if st.cfg.journal_window_ms.is_none() {
+        Some((journal_key(&st.cfg.prefix, seq), bytes))
+      } else {
+        if st.pending.is_empty() {
+          st.pending_lo = seq;
+        }
+        st.pending.extend_from_slice(&bytes);
+        if st.pending.len() as u64 >= st.cfg.journal_max_buffer_bytes {
+          flush_journal_pending(&*self.store, &mut st)?;
+        }
+        None
+      };
+      (group, strict_put)
     };
+
+    if let Some((jkey, bytes)) = strict_put {
+      // Durability before visibility: write the journal object first, then
+      // apply. The journal lock only serializes journal PUTs.
+      {
+        let _guard = self.journal_lock.lock();
+        self.store.put(&jkey, &bytes)?;
+      }
+      let mut st = self.state.write();
+      st.journal_seqs.insert(group.seq);
+    }
 
     for op in &group.ops {
       let ps = guards.get_mut(&op.part).expect("partition guard");
