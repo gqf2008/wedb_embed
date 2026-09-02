@@ -5,7 +5,7 @@ use std::fmt::Display;
 use thiserror::Error;
 
 /// Unified error type.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum Error {
   /// Underlying object store failure.
   #[error("object store error: {0}")]
@@ -15,7 +15,7 @@ pub enum Error {
   Corrupt(String),
   /// I/O error.
   #[error("i/o error: {0}")]
-  Io(#[from] std::io::Error),
+  Io(String),
   /// Encoding / decoding failure.
   #[error("encoding error: {0}")]
   Encode(String),
@@ -30,3 +30,9 @@ impl Error {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<std::io::Error> for Error {
+  fn from(e: std::io::Error) -> Self {
+    Error::Io(e.to_string())
+  }
+}

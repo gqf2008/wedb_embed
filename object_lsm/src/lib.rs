@@ -11,8 +11,8 @@
 //! - full memtables are flushed into immutable **block-indexed segment** objects;
 //! - a small **manifest** object records live segments + per-partition watermark.
 //!
-//! M2 (current milestone): block-indexed segment format, byte-range reads and
-//! block/index caches are in; ordered streaming iteration lands on top of them.
+//! M2 done: block-indexed segments, byte-range reads, block/index caches and
+//! ordered streaming iteration (forward/backward merges). Next: M3 compaction.
 
 pub mod batch;
 pub mod cache;
@@ -24,6 +24,7 @@ pub mod journal;
 pub mod keys;
 pub mod manifest;
 pub mod partition;
+mod scan;
 pub mod segment;
 pub mod state;
 pub mod store;
@@ -35,3 +36,4 @@ pub use engine::ObjectLsm;
 pub use error::{Error, Result};
 pub use partition::{ObjectLsmEntry, ObjectLsmIter, ObjectLsmPartition};
 pub use store::{MemoryStore, Store};
+

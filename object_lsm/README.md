@@ -14,7 +14,7 @@ write:  Batch::commit -> immutable journal group object (atomic PUT)
                         -> apply to per-partition memtable
                         -> spill to immutable sorted segment objects
                         -> publish manifest (segment list + watermark)
-read:   memtable hit (µs) -> newest->oldest segment scan (Range GET in M2)
+read:   memtable hit (µs) -> block-indexed Range GET scans through block cache
 crash:  current -> manifest -> replay journal groups newer than watermark
 ```
 
@@ -30,7 +30,7 @@ crash:  current -> manifest -> replay journal groups newer than watermark
 
 - [x] M0 scaffold: crate + `Store` abstraction + in-memory store + codec
 - [x] M1 vertical slice: memtable/journal/segment/manifest, recovery, Engine impl
-- [ ] M2 ordered streaming iteration, block-indexed segments + block cache
+- [x] M2 ordered streaming iteration, block-indexed segments + block cache
 - [ ] M3 compaction + orphan GC + journal GC
 - [ ] M4 compatibility harness vs `wedb_embed` tests + benchmarks
 - [ ] R2/S3 remote `Store` backend (feature-gated, needs credentials)
@@ -40,3 +40,4 @@ crash:  current -> manifest -> replay journal groups newer than watermark
 ```sh
 cargo test -p wedb_object_lsm
 ```
+

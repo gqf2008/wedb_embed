@@ -274,7 +274,12 @@ impl Inner {
   }
 
   /// Load (and cache) the block index of a segment via tail + index Range GETs.
-  fn load_index(&self, prefix: &str, part: &str, seg: &SegmentMeta) -> Result<Arc<SegmentIndex>> {
+  pub(crate) fn load_index(
+    &self,
+    prefix: &str,
+    part: &str,
+    seg: &SegmentMeta,
+  ) -> Result<Arc<SegmentIndex>> {
     if let Some(idx) = self.index_cache.get(seg.id) {
       return Ok(idx);
     }
@@ -298,7 +303,7 @@ impl Inner {
   }
 
   /// Load (and cache) one decoded block of a segment via a Range GET.
-  fn load_block(
+  pub(crate) fn load_block(
     &self,
     prefix: &str,
     part: &str,
@@ -353,7 +358,9 @@ impl Inner {
       let block = &index.blocks[bi];
       let entries = self.load_block(&prefix, name, seg, block)?;
       let idx = entries.partition_point(|(k, _)| k.as_slice() < key);
-      if let Some((_, v)) = entries.get(idx) {
+      if let Some((k, v)) = entries.get(idx)
+        && k.as_slice() == key
+      {
         // A tombstone here shadows any older segment value.
         return Ok(v.clone());
       }
