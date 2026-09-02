@@ -43,6 +43,11 @@
   url: https://github.com/ruanyf/weekly/issues/11467
   title: "【开源自荐】wedb_embed：纯 Rust 嵌入式 Redis 引擎，速度达 Redis 的 20~40 倍"
 
+- type: issue_submission
+  repo: 521xueweihan/HelloGitHub
+  url: https://github.com/521xueweihan/HelloGitHub/issues/3626
+  title: "[开源推荐] wedb_embed：纯 Rust 嵌入式 Redis 引擎，速度达 Redis 的 20~40 倍"
+
 - type: pr
   repo: TaKO8Ki/awesome-alternatives-in-rust
   url: https://github.com/TaKO8Ki/awesome-alternatives-in-rust/pull/150
@@ -57,6 +62,11 @@
   repo: currentslab/awesome-vector-search
   url: https://github.com/currentslab/awesome-vector-search/pull/69
   title: "Add wedb_embed to Library section"
+
+- type: pr
+  repo: dangkhoasdc/awesome-vector-database
+  url: https://github.com/dangkhoasdc/awesome-vector-database/pull/42
+  title: "Add wedb_embed to Multidimensional data / Vectors section"
 
 - type: issue_comment
   repo: vectordotdev/vector
