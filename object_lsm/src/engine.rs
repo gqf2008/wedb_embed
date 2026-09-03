@@ -22,8 +22,8 @@ use crate::{
   error::{Error, Result},
   journal::{Group, Op, decode_group_stream, encode_group},
   keys::{
-    current_key, journal_key, journal_prefix, manifest_key, manifest_prefix, parse_tail_seq,
-    segment_key, segment_root,
+    current_key, journal_key_epoch, journal_prefix_epoch, manifest_key, manifest_prefix,
+    parse_tail_seq, segment_key, segment_root,
   },
   lease::{Lease, LeaseOptions},
   manifest::Manifest,
@@ -223,7 +223,7 @@ fn recover(
   }
 
   // Replay every journal group newer than its partition watermark.
-  let list = store.list(&journal_prefix(prefix))?;
+  let list = store.list(&journal_prefix_epoch(prefix, st.fence_epoch))?;
   let mut max_seq = st.journal_seq;
   for k in &list {
     if let Some(s) = parse_tail_seq(k) {
@@ -246,7 +246,7 @@ fn recover(
     if s <= min_wm {
       continue;
     }
-    let Some(bytes) = store.get(&journal_key(prefix, s))? else {
+    let Some(bytes) = store.get(&journal_key_epoch(prefix, s, st.fence_epoch))? else {
       continue;
     };
     st.journal_sizes.insert(s, bytes.len() as u64);
@@ -517,7 +517,7 @@ fn gc_journal(store: &dyn Store, st: &mut EngineState) {
   }
   let doomed: Vec<u64> = st.journal_seqs.range(..=min_wm).copied().collect();
   for s in doomed {
-    let _ = store.delete(&journal_key(&st.cfg.prefix, s));
+    let _ = store.delete(&journal_key_epoch(&st.cfg.prefix, s, st.fence_epoch));
     st.journal_seqs.remove(&s);
     st.journal_sizes.remove(&s);
   }
@@ -574,7 +574,10 @@ fn flush_journal_pending(store: &dyn Store, st: &mut EngineState) -> Result<()> 
   }
   let end = st.journal_seq;
   let bytes = st.pending.len() as u64;
-  store.put(&journal_key(&st.cfg.prefix, end), &st.pending)?;
+  store.put(
+    &journal_key_epoch(&st.cfg.prefix, end, st.fence_epoch),
+    &st.pending,
+  )?;
   st.journal_seqs.insert(end);
   st.journal_sizes.insert(end, bytes);
   st.pending.clear();
@@ -692,7 +695,10 @@ impl Inner {
       };
       let bytes = encode_group(&group)?;
       let strict_put = if st.cfg.journal_window_ms.is_none() {
-        Some((journal_key(&st.cfg.prefix, seq), bytes))
+        Some((
+          journal_key_epoch(&st.cfg.prefix, seq, st.fence_epoch),
+          bytes,
+        ))
       } else {
         if st.pending.is_empty() {
           st.pending_lo = seq;

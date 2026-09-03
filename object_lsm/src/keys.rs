@@ -22,6 +22,17 @@ pub fn journal_key(prefix: &str, seq: u64) -> String {
   format!("{prefix}/journal/{seq:020}")
 }
 
+/// Epoch-namespaced journal key. Unfenced engines (epoch 0) keep the legacy
+/// flat layout; fenced engines isolate their journal objects per epoch so a
+/// stale writer can never overwrite a successor's object.
+pub fn journal_key_epoch(prefix: &str, seq: u64, epoch: u128) -> String {
+  if epoch == 0 {
+    journal_key(prefix, seq)
+  } else {
+    format!("{prefix}/journal/{epoch}/{seq:020}")
+  }
+}
+
 pub fn segment_key(prefix: &str, part: &str, id: u64) -> String {
   format!("{prefix}/seg/{part}/{id:020}")
 }
@@ -33,6 +44,15 @@ pub fn segment_root(prefix: &str) -> String {
 
 pub fn journal_prefix(prefix: &str) -> String {
   format!("{prefix}/journal/")
+}
+
+/// Listing prefix for the current fencing epoch.
+pub fn journal_prefix_epoch(prefix: &str, epoch: u128) -> String {
+  if epoch == 0 {
+    journal_prefix(prefix)
+  } else {
+    format!("{prefix}/journal/{epoch}/")
+  }
 }
 
 pub fn manifest_prefix(prefix: &str) -> String {
