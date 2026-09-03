@@ -87,6 +87,7 @@ Observed (Cloudflare R2 public internet from CN):
 | --- | --- | --- | --- |
 | fjall (local disk) | ~1 µs | ~0.3 µs | ~0.3 µs |
 | objectlsm (memory) | ~1 µs | ~0.5 µs | ~0.2 µs |
+| objectlsm (file, grouped 20 ms) | ~0.9 µs | ~3.5 µs | ~0.1 µs |
 | objectlsm (R2, strict) | ~0.30 s /op (per-commit PUT) | ~9–19 ms (Range GET) | µs (cache warm) |
 | objectlsm (R2, grouped 25 ms) | ~µs ack + flush | ~12 ms (Range GET) | µs (cache warm) |
 
@@ -163,3 +164,4 @@ writes are not guaranteed to be atomic at the filesystem level).
 directory in a fresh process to assert crash consistency:
 journal-after-commit, flush-after-compact, segment-upload-before-manifest,
 clear-publish-before-delete, compact-publish-before-delete.
+

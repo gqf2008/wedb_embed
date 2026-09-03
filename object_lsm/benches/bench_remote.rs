@@ -20,7 +20,7 @@ use std::{sync::Arc, time::Instant};
 use tempfile::tempdir;
 use wedb_embed::Fjall;
 use wedb_embed_engine::{Engine, Partition};
-use wedb_object_lsm::{Config, MemoryStore, ObjectLsm, R2Store, Store};
+use wedb_object_lsm::{Config, FileStore, MemoryStore, ObjectLsm, R2Store, Store};
 
 fn env_ok() -> bool {
   ["R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
@@ -116,6 +116,15 @@ fn main() {
   let store = MemoryStore::new();
   let mem = ObjectLsm::open(Arc::new(store), mk_cfg("bench/remote/mem")).expect("obj mem open");
   bench_engine(&label("objectlsm (memory)"), &mem, n);
+
+  // objectlsm over a local directory (FileStore)
+  let dir = tempdir().expect("tempdir file");
+  let file = ObjectLsm::open(
+    Arc::new(FileStore::new(dir.path()).expect("file store")),
+    mk_cfg("bench/remote/file"),
+  )
+  .expect("obj file open");
+  bench_engine(&label("objectlsm (file)"), &file, n);
 
   // objectlsm over Cloudflare R2
   if !env_ok() {
