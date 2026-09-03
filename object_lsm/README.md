@@ -82,20 +82,22 @@ cargo bench -p wedb_object_lsm --features "r2 wedb" --bench bench_remote
 # BENCH_N overrides the key count (default 200)
 ```
 
-Observed (Cloudflare R2 public internet from CN):
+Observed (Cloudflare R2 public internet from CN, re-measured 2026-09-03; local
+rows N=200, R2 strict N=40, R2 grouped N=200):
 
 | backend | insert (commit) | point read (warm) | scan (warm) |
 | --- | --- | --- | --- |
-| fjall (local disk) | ~1 µs | ~0.3 µs | ~0.3 µs |
-| objectlsm (memory) | ~1 µs | ~0.5 µs | ~0.2 µs |
-| objectlsm (file, grouped 20 ms) | ~0.9 µs | ~3.5 µs | ~0.1 µs |
-| objectlsm (R2, strict) | ~0.30 s /op (per-commit PUT) | ~9–19 ms (Range GET) | µs (cache warm) |
-| objectlsm (R2, grouped 25 ms) | ~µs ack + flush | ~12 ms (Range GET) | µs (cache warm) |
+| fjall (local disk) | ~0.9 µs | ~0.3 µs | ~0.2 µs |
+| objectlsm (memory) | ~1.6 µs | ~0.7 µs | ~0.2 µs |
+| objectlsm (file, grouped 20 ms) | ~0.8 µs | ~1.7 µs | ~0.1 µs |
+| objectlsm (R2, strict) | ~0.26 s /op (per-commit PUT) | ~4 ms (Range GET) | µs (cache warm) |
+| objectlsm (R2, grouped 25 ms) | ~0.9 µs ack + flush | ~8.9 ms (Range GET) | µs (cache warm) |
 
 Group-commit (`Config::journal_window_ms(Some(ms))`) turns queued commits into
-one journal object per window. For 40 durable commits the measured wall time
-dropped from ~11.8 s (strict, 40 PUTs) + ~9.2 s GC deletes to ~1.8 s total
-(strict mode totals ~21 s). Ack in grouped mode means "buffered"; durability
+one journal object per window. For 40 durable commits the measured insert
+wall time dropped from ~10.2 s (strict, one PUT per commit) to µs-level acks
+in grouped mode; the flush/compact step was ~10.6 s strict vs ~1.5 s grouped
+(N=200). Ack in grouped mode means "buffered"; durability
 is reached at the next flush (`persist()` forces one, so call it before
 shutdown or whenever you need a sync point), matching an AOF-every-N-ms
 trade-off. Warm cached reads/scans stay µs-level on R2.
