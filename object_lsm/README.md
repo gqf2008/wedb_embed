@@ -150,3 +150,16 @@ Cluster).
 
 
 
+
+## Local filesystem backend + process-level crash injection
+
+`FileStore` (no feature gate) implements [`Store`] over a local directory:
+objects are files under `root/key`, with byte-range reads, create-if-absent,
+compare-and-swap and prefix listing. It is a test/reference backend (object
+writes are not guaranteed to be atomic at the filesystem level).
+
+`tests/crash.rs` spawns the test binary itself, performs a scenario, then calls
+`std::process::abort()` at a precise durability step and reopens the same
+directory in a fresh process to assert crash consistency:
+journal-after-commit, flush-after-compact, segment-upload-before-manifest,
+clear-publish-before-delete, compact-publish-before-delete.

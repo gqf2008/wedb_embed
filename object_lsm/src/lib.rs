@@ -22,6 +22,7 @@ pub mod codec;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod file;
 pub mod journal;
 pub mod keys;
 pub mod lease;
@@ -51,6 +52,7 @@ impl From<Error> for wedb_embed::Error {
   }
 }
 
+pub use file::FileStore;
 pub use lease::{Lease, LeaseOptions};
 #[cfg(feature = "r2")]
 pub use r2::{R2Config, R2Store};
