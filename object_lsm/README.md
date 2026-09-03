@@ -45,14 +45,15 @@ write-adjacent maintenance:
 ## Test
 
 ```sh
-cargo test -p wedb_object_lsm              # engine tests (21)
-cargo test -p wedb_object_lsm --features wedb   # + wedb_embed parity harness (23)
+cargo test -p wedb_object_lsm              # engine tests (58)
+cargo test -p wedb_object_lsm --features wedb   # + wedb_embed parity harness (2)
 cargo bench -p wedb_object_lsm             # point read / scan / insert benches
 ```
 
 The `wedb` feature adds an optional `wedb_embed` backend bridge plus the M4
 compatibility harness: identical Redis-style scripts (string/hash/list/set/
-zset/bitmap/stream + cross-type errors + namespaces) run against both `Fjall`
+zset/bitmap/stream/geo/json/hll/bloom/cuckoo/tdigest/sortedint/timeseries/
+key-expiry + cross-type errors + namespaces) run against both `Fjall`
 (reference) and `ObjectLsm`, asserting byte-identical result logs, and a
 reopen-persistence test for `ObjectLsm`.
 
