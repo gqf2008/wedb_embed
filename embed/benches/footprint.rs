@@ -3,7 +3,7 @@ use std::{
   fmt::Write as _,
   fs,
   io::{Read, Write},
-  path::Path,
+  path::{Path, PathBuf},
   process::Command,
   time::Duration,
 };
@@ -78,6 +78,34 @@ fn parse_redis_memory_from_str(s: &str) -> (u64, u64) {
 }
 
 /// 通过直连 Unix 套接字或 redis-cli 查询 Redis 内存占用
+fn query_redis_data_dir() -> PathBuf {
+  if let Ok(mut stream) =
+    RedisConn::connect_with_timeout(Duration::from_secs(10), Duration::from_secs(10))
+    && stream
+      .write_all(b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$3\r\ndir\r\n")
+      .is_ok()
+  {
+    let mut buf = [0u8; 8192];
+    if let Ok(n) = stream.read(&mut buf)
+      && n > 0
+    {
+      let s = String::from_utf8_lossy(&buf[..n]);
+      if let Some(line) = s.lines().nth(4) {
+        let line = line.trim();
+        let path = if let Some(p) = line.strip_prefix('/') {
+          PathBuf::from(format!("C:{p}"))
+        } else {
+          PathBuf::from(line)
+        };
+        if path.is_dir() {
+          return path;
+        }
+      }
+    }
+  }
+  redis_conn::redis_data_dir()
+}
+
 fn query_redis_memory() -> (u64, u64) {
   let mut mem = 0u64;
   let mut rss = 0u64;
@@ -549,7 +577,7 @@ fn main() {
     }
 
     // 读取 Redis 磁盘持久化文件占用
-    let redis_data_path = redis_conn::redis_data_dir();
+    let redis_data_path = query_redis_data_dir();
     if redis_data_path.exists() {
       redis_disk_bytes = dir_size(&redis_data_path);
     }
