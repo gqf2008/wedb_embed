@@ -474,27 +474,39 @@ fn read_segment_entries(
   seg: &SegmentMeta,
 ) -> Result<SegmentEntries> {
   let key = segment_key(prefix, part, seg.id);
-  let tail_raw = store
-    .get_range(
-      &key,
-      seg.bytes.saturating_sub(TAIL_LEN as u64),
-      TAIL_LEN as u64,
-    )?
-    .ok_or_else(|| Error::Corrupt(format!("segment {} tail missing", seg.id)))?;
-  let tail = parse_tail(&tail_raw)?;
-  let idx_raw = store
-    .get_range(&key, tail.index_offset as u64, tail.index_len as u64)?
-    .ok_or_else(|| Error::Corrupt(format!("segment {} index missing", seg.id)))?;
-  let index = decode_index(&idx_raw)?;
+  // Compaction consumes every block of the segment, so fetch the whole object
+  // once instead of issuing one Range GET per block. This turns O(blocks)
+  // remote requests into one request and keeps the merge fully local.
+  let bytes = store
+    .get(&key)?
+    .ok_or_else(|| Error::Corrupt(format!("segment {} missing", seg.id)))?;
+  if bytes.len() < TAIL_LEN {
+    return Err(Error::Corrupt(format!(
+      "segment {} shorter than trailer",
+      seg.id
+    )));
+  }
+  let tail = parse_tail(&bytes[bytes.len() - TAIL_LEN..])?;
+  let idx_start = tail.index_offset as usize;
+  let idx_end = idx_start.saturating_add(tail.index_len as usize);
+  if idx_end > bytes.len() - TAIL_LEN {
+    return Err(Error::Corrupt(format!(
+      "segment {} index out of bounds",
+      seg.id
+    )));
+  }
+  let index = decode_index(&bytes[idx_start..idx_end])?;
   let mut out = SegmentEntries::new();
   for bm in &index.blocks {
-    let raw = store
-      .get_range(&key, bm.offset as u64, bm.len as u64)?
-      .ok_or_else(|| Error::Corrupt(format!("segment {} block missing", seg.id)))?;
-    if raw.len() < BLOCK_HEADER_LEN {
-      return Err(Error::Corrupt("block shorter than header".into()));
+    let start = bm.offset as usize;
+    let end = start.saturating_add(bm.len as usize);
+    if end > bytes.len() {
+      return Err(Error::Corrupt(format!(
+        "segment {} block out of bounds",
+        seg.id
+      )));
     }
-    out.extend(decode_block(&raw)?);
+    out.extend(decode_block(&bytes[start..end])?);
   }
   Ok(out)
 }
