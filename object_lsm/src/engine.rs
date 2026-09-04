@@ -566,22 +566,51 @@ fn gc_objects_at_open(store: &dyn Store, st: &mut EngineState) -> Result<()> {
   Ok(())
 }
 
+/// Detach the pending group-commit buffer for an out-of-lock upload.
+///
+/// The caller holds the global state lock only while taking the buffer and
+/// reserving its end sequence. The remote object PUT happens afterwards
+/// without blocking commits; `finish_flushed_journal` records the object
+/// after the upload succeeds.
+fn take_journal_pending(st: &mut EngineState) -> Option<(String, Vec<u8>)> {
+  if st.pending.is_empty() || st.journal_flushing {
+    return None;
+  }
+  let end = st.journal_seq;
+  st.journal_flushing = true;
+  Some((
+    journal_key_epoch(&st.cfg.prefix, end, st.fence_epoch),
+    std::mem::take(&mut st.pending),
+  ))
+}
+
+/// Record a successfully uploaded detached journal object.
+fn finish_flushed_journal(st: &mut EngineState, key: &str, bytes_len: u64) {
+  st.journal_flushing = false;
+  if let Some(end) = parse_tail_seq(key) {
+    st.journal_seqs.insert(end);
+    st.journal_sizes.insert(end, bytes_len);
+  }
+  st.pending_lo = 0;
+}
+
+/// Abort a detached upload and restore its buffer for a later flush.
+fn abort_journal_flush(st: &mut EngineState, buffer: Vec<u8>) {
+  st.journal_flushing = false;
+  if st.pending.is_empty() {
+    st.pending = buffer;
+  }
+}
+
 /// Flush the pending group-commit buffer into one journal object covering
 /// groups `pending_lo..=journal_seq`.
 fn flush_journal_pending(store: &dyn Store, st: &mut EngineState) -> Result<()> {
-  if st.pending.is_empty() {
+  let Some((key, buffer)) = take_journal_pending(st) else {
     return Ok(());
-  }
-  let end = st.journal_seq;
-  let bytes = st.pending.len() as u64;
-  store.put(
-    &journal_key_epoch(&st.cfg.prefix, end, st.fence_epoch),
-    &st.pending,
-  )?;
-  st.journal_seqs.insert(end);
-  st.journal_sizes.insert(end, bytes);
-  st.pending.clear();
-  st.pending_lo = 0;
+  };
+  let bytes = buffer.len() as u64;
+  store.put(&key, &buffer)?;
+  finish_flushed_journal(st, &key, bytes);
   Ok(())
 }
 
@@ -607,10 +636,21 @@ fn spawn_journal_flusher(inner: Arc<Inner>) {
         let Some(inner) = weak.upgrade() else {
           return;
         };
-        {
+        if let Some((key, buffer)) = {
           let mut st = inner.state.write();
-          if !st.pending.is_empty() && flush_journal_pending(&*inner.store, &mut st).is_ok() {
-            gc_journal(&*inner.store, &mut st);
+          take_journal_pending(&mut st)
+        } {
+          match inner.store.put(&key, &buffer) {
+            Ok(()) => {
+              let bytes = buffer.len() as u64;
+              let mut st = inner.state.write();
+              finish_flushed_journal(&mut st, &key, bytes);
+              gc_journal(&*inner.store, &mut st);
+            }
+            Err(_) => {
+              let mut st = inner.state.write();
+              abort_journal_flush(&mut st, buffer);
+            }
           }
         }
       }

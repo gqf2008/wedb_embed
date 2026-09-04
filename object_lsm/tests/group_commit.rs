@@ -1,6 +1,13 @@
 //! Group-commit journal batching tests (Config::journal_window_ms).
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  thread,
+  time::{Duration, Instant},
+};
 
 use wedb_embed_engine::{Engine, Partition};
 use wedb_object_lsm::{
@@ -126,4 +133,66 @@ fn strict_mode_keeps_one_object_per_commit() {
     5,
     "strict mode writes one durable object per commit"
   );
+}
+
+#[test]
+fn background_flush_upload_does_not_hold_state_lock() {
+  struct BlockingPutStore {
+    inner: MemoryStore,
+    uploads: AtomicUsize,
+  }
+
+  impl Store for BlockingPutStore {
+    fn get(&self, key: &str) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+      self.inner.get(key)
+    }
+
+    fn get_range(
+      &self,
+      key: &str,
+      offset: u64,
+      len: u64,
+    ) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+      self.inner.get_range(key, offset, len)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> wedb_object_lsm::Result<()> {
+      self.uploads.fetch_add(1, Ordering::SeqCst);
+      thread::sleep(Duration::from_millis(300));
+      self.inner.put(key, data)
+    }
+
+    fn delete(&self, key: &str) -> wedb_object_lsm::Result<()> {
+      self.inner.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> wedb_object_lsm::Result<Vec<String>> {
+      self.inner.list(prefix)
+    }
+  }
+
+  let store = Arc::new(BlockingPutStore {
+    inner: MemoryStore::new(),
+    uploads: AtomicUsize::new(0),
+  });
+  let cfg = window_cfg("gc/nonblocking", 5);
+  let eng = ObjectLsm::open(store.clone(), cfg).unwrap();
+  let p = eng.partition("data").unwrap();
+  p.insert(b"k1", b"v1").unwrap();
+
+  // Wait until the background flusher is inside its remote PUT.
+  while store.uploads.load(Ordering::SeqCst) == 0 {
+    thread::sleep(Duration::from_millis(5));
+  }
+  // This commit must not wait behind the detached journal PUT.
+  let started = Instant::now();
+  p.insert(b"k2", b"v2").unwrap();
+  assert!(
+    started.elapsed() < Duration::from_millis(200),
+    "commit blocked on background journal PUT"
+  );
+
+  // Let the flush finish and force one final durable sync.
+  thread::sleep(Duration::from_millis(500));
+  eng.persist().unwrap();
 }

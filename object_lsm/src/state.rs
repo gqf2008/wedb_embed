@@ -231,6 +231,8 @@ pub struct EngineState {
   pub pending: Vec<u8>,
   /// First seq present in `pending` (0 when empty).
   pub pending_lo: u64,
+  /// A flusher is currently uploading the detached pending buffer.
+  pub journal_flushing: bool,
   /// Completed merge compactions (metrics).
   pub compactions_completed: u64,
   /// Fencing epoch for leased engines (0 = unfenced).
@@ -253,6 +255,7 @@ impl EngineState {
       compactions_completed: 0,
       pending: Vec::new(),
       pending_lo: 0,
+      journal_flushing: false,
       fence_epoch: 0,
       current_bytes: None,
     }
