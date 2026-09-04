@@ -56,6 +56,9 @@ fn mk_cfg(prefix: &str) -> Config {
   Config::new(prefix)
     .max_memtable_bytes(1 << 20)
     .block_size(4096)
+    // Avoid compaction inside the hot write loop: tiny datasets used to reach
+    // 16 segments early and repeatedly fold the same data during writes.
+    .max_segments_before_compact(1_000_000)
     .journal_window_ms(window_ms())
 }
 
