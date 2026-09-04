@@ -109,9 +109,10 @@ Run: `OBJLSM_WINDOW_MS=25 BENCH_N=200 cargo bench -p wedb_object_lsm --features 
 | keys | insert wall | insert/op | compact wall | warm read/op | object state after compact | reopen |
 | --- | ---: | ---: | ---: | ---: | --- | --- |
 | 1,000 | 0.85 ms ack | 0.84 µs | 1.8 s | 3.39 ms | 1 segment, 0 journal, disk 95.5 KB | all keys recovered in 0.69 s |
-| 10,000 | 38.1 s | 3.81 ms | 45.5 s | 3.33 ms | 1 segment, 0 journal, disk 951 KB | all keys recovered in 1.21 s |
+| 10,000 (auto-compaction during writes) | 38.1 s | 3.81 ms | 45.5 s | 3.33 ms | 1 segment, 0 journal, disk 951 KB | all keys recovered in 1.21 s |
+| 10,000 (compaction deferred) | 21.6 s | 2.16 ms | 50.8 s | 3.24 ms | 1 segment, 0 journal, disk 951 KB | all keys recovered in 1.19 s |
 
-The 10k run is a **soak-scale check**, not a claim of maximum throughput: under
+The deferred-compaction run disables automatic compaction in the write loop (`max_segments_before_compact(1_000_000)`) and folds everything in the explicit compact phase; it is a **soak-scale check**, not a claim of maximum throughput: under
 this configuration the journal flusher periodically blocks memtable flushes on
 remote R2 PUTs, making wall time non-linear. The important reliability results
 are stable: journal GC reaches zero objects, compaction folds the dataset to a
