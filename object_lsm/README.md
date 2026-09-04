@@ -104,6 +104,21 @@ trade-off. Warm cached reads/scans stay µs-level on R2.
 
 Run: `OBJLSM_WINDOW_MS=25 BENCH_N=200 cargo bench -p wedb_object_lsm --features "r2 wedb" --bench bench_remote`
 
+### R2 scale check (grouped 25 ms, 2026-09-04)
+
+| keys | insert wall | insert/op | compact wall | warm read/op | object state after compact | reopen |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| 1,000 | 0.85 ms ack | 0.84 µs | 1.8 s | 3.39 ms | 1 segment, 0 journal, disk 95.5 KB | all keys recovered in 0.69 s |
+| 10,000 | 38.1 s | 3.81 ms | 45.5 s | 3.33 ms | 1 segment, 0 journal, disk 951 KB | all keys recovered in 1.21 s |
+
+The 10k run is a **soak-scale check**, not a claim of maximum throughput: under
+this configuration the journal flusher periodically blocks memtable flushes on
+remote R2 PUTs, making wall time non-linear. The important reliability results
+are stable: journal GC reaches zero objects, compaction folds the dataset to a
+single segment, cold reads stay low single-digit ms, and every key is recovered
+after reopen. Reopen time grows sub-linearly with key count here (manifest /
+segment metadata, not a full key replay).
+
 ## Multi-instance shared bucket: lease + sharding
 
 `ObjectLsm::open_leased(store, cfg, LeaseOptions)` makes an instance the
