@@ -34,6 +34,11 @@ pub struct Config {
   /// Upper bound of the in-memory pending journal buffer (bytes) before a
   /// synchronous flush is forced.
   pub journal_max_buffer_bytes: u64,
+  /// Flush full memtables on a background worker instead of inside the commit
+  /// path. Commits remain durable through journal objects; the worker uploads
+  /// immutable segment objects and publishes the manifest later. Explicit
+  /// `persist()` / `compact()` still perform synchronous maintenance.
+  pub background_flush: bool,
   /// Embed each segment's block index in the manifest. `true` (default) makes
   /// a cold point read a single block Range GET; `false` shrinks the manifest
   /// at the cost of tail+index Range GETs on cold reads.
@@ -57,6 +62,7 @@ impl Default for Config {
       max_segments_before_compact: DEFAULT_MAX_SEGMENTS_BEFORE_COMPACT,
       journal_window_ms: None,
       journal_max_buffer_bytes: 1024 * 1024,
+      background_flush: false,
       eager_object_delete: true,
       manifest_embed_index: true,
     }
@@ -105,6 +111,12 @@ impl Config {
   /// Upper bound of the pending journal buffer before a synchronous flush.
   pub fn journal_max_buffer_bytes(mut self, bytes: u64) -> Self {
     self.journal_max_buffer_bytes = bytes;
+    self
+  }
+
+  /// Move memtable segment uploads off the commit path.
+  pub fn background_flush(mut self, enabled: bool) -> Self {
+    self.background_flush = enabled;
     self
   }
 

@@ -206,6 +206,16 @@ impl PartitionTable {
   }
 }
 
+/// A detached memtable snapshot being uploaded by a background flush worker.
+#[derive(Debug, Clone)]
+pub struct PendingFlush {
+  pub partition: String,
+  pub watermark: u64,
+  pub segment_id: u64,
+  pub encoded: Vec<u8>,
+  pub entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
 /// Whole-engine state guarded by a single read/write lock.
 ///
 /// Only global metadata lives here. `partitions` is the durable/manifest view;
@@ -233,6 +243,8 @@ pub struct EngineState {
   pub pending_lo: u64,
   /// A flusher is currently uploading the detached pending buffer.
   pub journal_flushing: bool,
+  /// Detached memtable snapshots uploaded by background flush workers.
+  pub pending_flushes: BTreeMap<String, PendingFlush>,
   /// Completed merge compactions (metrics).
   pub compactions_completed: u64,
   /// Fencing epoch for leased engines (0 = unfenced).
@@ -256,6 +268,7 @@ impl EngineState {
       pending: Vec::new(),
       pending_lo: 0,
       journal_flushing: false,
+      pending_flushes: BTreeMap::new(),
       fence_epoch: 0,
       current_bytes: None,
     }

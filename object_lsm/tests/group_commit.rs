@@ -196,3 +196,69 @@ fn background_flush_upload_does_not_hold_state_lock() {
   thread::sleep(Duration::from_millis(500));
   eng.persist().unwrap();
 }
+
+#[test]
+fn background_memtable_flush_does_not_block_commit() {
+  struct BlockingSegmentStore {
+    inner: MemoryStore,
+    uploads: AtomicUsize,
+  }
+
+  impl Store for BlockingSegmentStore {
+    fn get(&self, key: &str) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+      self.inner.get(key)
+    }
+
+    fn get_range(
+      &self,
+      key: &str,
+      offset: u64,
+      len: u64,
+    ) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+      self.inner.get_range(key, offset, len)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> wedb_object_lsm::Result<()> {
+      if key.contains("/seg/") {
+        self.uploads.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(300));
+      }
+      self.inner.put(key, data)
+    }
+
+    fn delete(&self, key: &str) -> wedb_object_lsm::Result<()> {
+      self.inner.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> wedb_object_lsm::Result<Vec<String>> {
+      self.inner.list(prefix)
+    }
+  }
+
+  let store = Arc::new(BlockingSegmentStore {
+    inner: MemoryStore::new(),
+    uploads: AtomicUsize::new(0),
+  });
+  let cfg = Config::new("gc/bgflush")
+    .max_memtable_bytes(32)
+    .block_size(64)
+    .background_flush(true)
+    .journal_window_ms(Some(5));
+  let eng = ObjectLsm::open(store.clone(), cfg).unwrap();
+  let p = eng.partition("data").unwrap();
+  p.insert(b"k1", b"v1").unwrap();
+
+  while store.uploads.load(Ordering::SeqCst) == 0 {
+    thread::sleep(Duration::from_millis(5));
+  }
+  let started = Instant::now();
+  p.insert(b"k2", b"v2").unwrap();
+  assert!(
+    started.elapsed() < Duration::from_millis(200),
+    "commit blocked on background segment upload"
+  );
+  // Let the blocked segment PUT finish; otherwise persist() competes for the
+  // same pending snapshot on the worker thread.
+  thread::sleep(Duration::from_millis(500));
+  eng.persist().unwrap();
+}

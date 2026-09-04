@@ -32,7 +32,9 @@ use crate::{
     BLOCK_HEADER_LEN, BlockMeta, SegmentEntries, SegmentIndex, SegmentMeta, TAIL_LEN,
     build_segment_meta, decode_block, decode_index, encode_segment, find_block, parse_tail,
   },
-  state::{EngineState, MemEntry, PartitionLock, PartitionState, PartitionTable, ReaderGate},
+  state::{
+    EngineState, MemEntry, PartitionLock, PartitionState, PartitionTable, PendingFlush, ReaderGate,
+  },
   store::Store,
 };
 
@@ -139,6 +141,9 @@ impl ObjectLsm {
     });
     if cfg.journal_window_ms.is_some() {
       spawn_journal_flusher(inner.clone());
+    }
+    if cfg.background_flush {
+      spawn_background_flusher(inner.clone());
     }
     Ok(Self { inner, lease: None })
   }
@@ -383,6 +388,81 @@ fn flush_partition(store: &dyn Store, st: &mut EngineState, ps: &mut PartitionSt
   ps.mem_bytes = 0;
   sync_partition_meta(st, ps);
   publish_manifest(store, st)
+}
+
+/// Detach a full memtable snapshot for background upload.
+fn take_partition_flush(st: &mut EngineState, ps: &mut PartitionState) -> Option<PendingFlush> {
+  if ps.meta.dropped
+    || ps.mem.is_empty()
+    || st.pending_flushes.contains_key(&ps.name)
+    || ps.mem_bytes < st.cfg.max_memtable_bytes
+  {
+    return None;
+  }
+
+  let entries: SegmentEntries = ps
+    .mem
+    .iter()
+    .map(|(k, e)| {
+      let v = match e {
+        MemEntry::Value(v) => Some(v.clone()),
+        MemEntry::Tombstone => None,
+      };
+      (k.clone(), v)
+    })
+    .collect();
+  let encoded = encode_segment(&entries, st.cfg.block_size as usize).ok()?;
+  let segment_id = st.next_segment_id;
+  st.next_segment_id += 1;
+  let pending = PendingFlush {
+    partition: ps.name.clone(),
+    watermark: ps.meta.watermark.max(st.journal_seq),
+    segment_id,
+    encoded,
+    entries,
+  };
+  ps.mem.clear();
+  ps.mem_bytes = 0;
+  st.pending_flushes
+    .insert(pending.partition.clone(), pending.clone());
+  Some(pending)
+}
+
+/// Publish a completed background segment upload into the partition metadata.
+fn finish_partition_flush(inner: &Inner, part: &str) -> Result<()> {
+  let Some(active) = ({
+    let mut st = inner.state.write();
+    st.pending_flushes.remove(part)
+  }) else {
+    return Ok(());
+  };
+  let (key, embed_index) = {
+    let st = inner.state.read();
+    (
+      segment_key(&st.cfg.prefix, part, active.segment_id),
+      st.cfg.manifest_embed_index,
+    )
+  };
+  inner.store.put(&key, &active.encoded)?;
+  let meta = build_segment_meta(
+    active.segment_id,
+    active.watermark,
+    &active.encoded,
+    &active.entries,
+    embed_index,
+  )?;
+  let lock = inner
+    .partitions
+    .get(part)
+    .ok_or_else(|| Error::store("flush partition disappeared"))?;
+  let mut ps = lock.write();
+  let mut st = inner.state.write();
+  ps.meta.segments.push(meta);
+  ps.meta.watermark = ps.meta.watermark.max(active.watermark);
+  sync_partition_meta(&mut st, &ps);
+  publish_manifest(&*inner.store, &mut st)?;
+  gc_journal(&*inner.store, &mut st);
+  Ok(())
 }
 
 /// Read every entry of a segment object via tail/index/block Range GETs
@@ -658,6 +738,31 @@ fn spawn_journal_flusher(inner: Arc<Inner>) {
     .ok();
 }
 
+fn spawn_background_flusher(inner: Arc<Inner>) {
+  let weak = Arc::downgrade(&inner);
+  thread::Builder::new()
+    .name("objectlsm-flush".into())
+    .spawn(move || {
+      loop {
+        thread::sleep(Duration::from_millis(10));
+        let Some(inner) = weak.upgrade() else {
+          return;
+        };
+        if !inner.state.read().cfg.background_flush {
+          continue;
+        }
+        let parts: Vec<String> = {
+          let st = inner.state.read();
+          st.pending_flushes.keys().cloned().collect()
+        };
+        for part in parts {
+          let _ = finish_partition_flush(&inner, &part);
+        }
+      }
+    })
+    .ok();
+}
+
 impl Inner {
   /// Best-effort fencing: reject mutations once the held writer lease has
   /// been marked lost (e.g. heartbeat renewal failed after expiry).
@@ -786,10 +891,15 @@ impl Inner {
         })
         .cloned()
         .collect();
+      let background_flush = st.cfg.background_flush;
       for name in over {
-        // Maintenance after the durability point must not turn an already
-        // committed batch into an error: leave the memtable for a later flush.
-        let _ = flush_partition(&*self.store, &mut st, guards.get_mut(&name).expect("guard"));
+        if background_flush {
+          let _ = take_partition_flush(&mut st, guards.get_mut(&name).expect("guard"));
+        } else {
+          // Maintenance after the durability point must not turn an already
+          // committed batch into an error: leave the memtable for a later flush.
+          let _ = flush_partition(&*self.store, &mut st, guards.get_mut(&name).expect("guard"));
+        }
       }
 
       let seg_limit = st.cfg.max_segments_before_compact;
@@ -913,6 +1023,11 @@ impl Inner {
       }
       ps.meta.segments.clone()
     };
+    if let Some(pending) = self.state.read().pending_flushes.get(name)
+      && let Some(e) = pending.entries.iter().find(|(k, _)| k.as_slice() == key)
+    {
+      return Ok(e.1.clone());
+    }
 
     for seg in segments.iter().rev() {
       if seg.first.as_slice() > key || seg.last.as_slice() < key {
@@ -953,6 +1068,7 @@ impl Inner {
     ps.mem.clear();
     ps.mem_bytes = 0;
     ps.meta.watermark = tail_seq;
+    st.pending_flushes.remove(name);
     ps.meta.dropped = false;
     sync_partition_meta(&mut st, &ps);
     publish_manifest(&*self.store, &mut st)?;
@@ -981,6 +1097,7 @@ impl Inner {
     ps.mem.clear();
     ps.mem_bytes = 0;
     ps.meta.watermark = tail_seq;
+    st.pending_flushes.remove(name);
     ps.meta.dropped = true;
     sync_partition_meta(&mut st, &ps);
     publish_manifest(&*self.store, &mut st)?;
@@ -997,6 +1114,9 @@ impl Inner {
   /// Flush + merge-compact a single partition.
   pub(crate) fn compact_partition(&self, name: &str) -> Result<()> {
     self.ensure_writer()?;
+    if self.state.read().pending_flushes.contains_key(name) {
+      finish_partition_flush(self, name)?;
+    }
     let Some(lock) = self.partition_lock(name) else {
       return Ok(());
     };
@@ -1016,6 +1136,10 @@ impl Inner {
   /// Flush + merge-compact every non-dropped partition.
   pub(crate) fn compact_all(&self) -> Result<()> {
     self.ensure_writer()?;
+    let pending: Vec<String> = self.state.read().pending_flushes.keys().cloned().collect();
+    for name in pending {
+      finish_partition_flush(self, &name)?;
+    }
     let names = self.partitions.names();
     for name in names {
       let Some(lock) = self.partition_lock(&name) else {
@@ -1145,6 +1269,20 @@ impl Engine for ObjectLsm {
       let mut st = self.inner.state.write();
       flush_journal_pending(&*self.inner.store, &mut st)?;
       gc_journal(&*self.inner.store, &mut st);
+    }
+    // Background memtable uploads are durable through journal objects even
+    // before their segments are published, but persist() also drains any
+    // already-detached segment snapshots to reach the fully folded state.
+    let parts: Vec<String> = self
+      .inner
+      .state
+      .read()
+      .pending_flushes
+      .keys()
+      .cloned()
+      .collect();
+    for part in parts {
+      finish_partition_flush(&self.inner, &part)?;
     }
     Ok(())
   }

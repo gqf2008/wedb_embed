@@ -59,6 +59,7 @@ fn mk_cfg(prefix: &str) -> Config {
     // Avoid compaction inside the hot write loop: tiny datasets used to reach
     // 16 segments early and repeatedly fold the same data during writes.
     .max_segments_before_compact(1_000_000)
+    .background_flush(matches!(std::env::var("OBJLSM_BACKGROUND_FLUSH"), Ok(v) if v != "0"))
     .journal_window_ms(window_ms())
 }
 
