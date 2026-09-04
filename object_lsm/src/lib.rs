@@ -39,6 +39,14 @@ pub use batch::ObjectLsmBatch;
 pub use cache::{BlockCache, IndexCache};
 pub use config::Config;
 pub use engine::ObjectLsm;
+
+impl ObjectLsm {
+  /// Shared object-store handle used by this engine instance.
+  pub fn store(&self) -> &std::sync::Arc<dyn Store> {
+    &self.inner.store
+  }
+}
+
 pub use error::{Error, Result};
 pub use partition::{ObjectLsmEntry, ObjectLsmIter, ObjectLsmPartition};
 pub use store::{MemoryStore, Store};

@@ -20,7 +20,10 @@ use std::{sync::Arc, time::Instant};
 use tempfile::tempdir;
 use wedb_embed::Fjall;
 use wedb_embed_engine::{Engine, Partition};
-use wedb_object_lsm::{Config, FileStore, MemoryStore, ObjectLsm, R2Store, Store};
+use wedb_object_lsm::{
+  Config, FileStore, MemoryStore, ObjectLsm, R2Store, Store,
+  keys::{journal_prefix, manifest_prefix},
+};
 
 fn env_ok() -> bool {
   ["R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
@@ -102,6 +105,32 @@ fn bench_engine<E: Engine>(name: &str, eng: &E, n: usize) {
   report(name, "scan entries", count, t.elapsed());
 }
 
+fn percentiles(mut xs: Vec<u128>) -> Option<(u128, u128, u128)> {
+  if xs.is_empty() {
+    return None;
+  }
+  xs.sort_unstable();
+  let pick = |p: f64| -> u128 {
+    let idx = ((xs.len() as f64 - 1.0) * p).round() as usize;
+    xs[idx.min(xs.len() - 1)]
+  };
+  Some((pick(0.50), pick(0.95), pick(0.99)))
+}
+
+fn report_object_stats(eng: &ObjectLsm, store: &Arc<R2Store>, prefix: &str) {
+  let journals = store.list(&journal_prefix(prefix)).unwrap_or_default();
+  let manifests = store.list(&manifest_prefix(prefix)).unwrap_or_default();
+  let segments = store.list(&format!("{prefix}/seg/")).unwrap_or_default();
+  println!(
+    "{:>22} objects journal={} segment={} manifest={} disk_space={}",
+    "object stats",
+    journals.len(),
+    segments.len(),
+    manifests.len(),
+    eng.disk_space().unwrap_or(0)
+  );
+}
+
 fn main() {
   let n = n_default();
   println!("ObjectLsm backend comparison  (n = {n} keys)");
@@ -134,6 +163,51 @@ fn main() {
   let r2store = Arc::new(R2Store::from_env().expect("r2 store"));
   let r2 = ObjectLsm::open(r2store.clone(), mk_cfg("wedb_bench/remote")).expect("obj r2 open");
   bench_engine(&label("objectlsm (R2)"), &r2, n);
+
+  // R2 object footprint + reopen/recovery validation
+  report_object_stats(&r2, &r2store, "wedb_bench/remote");
+  {
+    let p = r2.partition("bench").expect("reopen partition");
+    let mut samples = Vec::with_capacity(n);
+    for i in 0..n {
+      let t = Instant::now();
+      let v = p.get(&key(i)).expect("cold get");
+      assert_eq!(v.as_deref(), Some(VAL));
+      samples.push(t.elapsed().as_micros());
+    }
+    if let Some((p50, p95, p99)) = percentiles(samples) {
+      println!(
+        "{:>22} point read cold        us p50={} p95={} p99={}",
+        label("objectlsm (R2)"),
+        p50,
+        p95,
+        p99
+      );
+    }
+  }
+
+  drop(r2);
+  {
+    let t = Instant::now();
+    let r2_reopen =
+      ObjectLsm::open(r2store.clone(), mk_cfg("wedb_bench/remote")).expect("reopen r2");
+    let reopen_us = t.elapsed().as_micros();
+    let p = r2_reopen.partition("bench").expect("partition");
+    let mut count = 0usize;
+    for e in p.iter() {
+      assert!(e.is_ok());
+      count += 1;
+    }
+    assert_eq!(count, n, "R2 reopen lost keys");
+    println!(
+      "{:>22} reopen/recovery       {} keys in {} us",
+      label("objectlsm (R2)"),
+      n,
+      reopen_us
+    );
+    report_object_stats(&r2_reopen, &r2store, "wedb_bench/remote");
+    drop(r2_reopen);
+  }
 
   // cleanup R2 prefix (best effort)
   for key in r2store.list("wedb_bench/remote").expect("list") {
