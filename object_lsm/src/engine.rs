@@ -511,6 +511,51 @@ fn read_segment_entries(
   Ok(out)
 }
 
+/// Read all `segs` in bounded parallel batches, preserving segment order.
+///
+/// Compaction consumes every block of every segment, so the R2/S3 latency is
+/// dominated by the object GETs. Issuing them from up to a few scoped worker
+/// threads overlaps the network round-trips instead of serializing them.
+fn read_segments_parallel(
+  store: &dyn Store,
+  prefix: &str,
+  part: &str,
+  segs: &[SegmentMeta],
+) -> Result<Vec<SegmentEntries>> {
+  const WORKERS: usize = 8;
+  let n = segs.len();
+  if n == 0 {
+    return Ok(Vec::new());
+  }
+  let workers = n.min(WORKERS);
+  let per = n.div_ceil(workers);
+  std::thread::scope(|scope| -> Result<Vec<SegmentEntries>> {
+    let mut handles = Vec::with_capacity(workers);
+    for w in 0..workers {
+      let start = w * per;
+      if start >= n {
+        break;
+      }
+      handles.push(scope.spawn(move || {
+        let mut out = Vec::new();
+        let end = (start + per).min(n);
+        for seg in &segs[start..end] {
+          out.push(read_segment_entries(store, prefix, part, seg)?);
+        }
+        Ok::<_, Error>(out)
+      }));
+    }
+    let mut all = Vec::with_capacity(n);
+    for h in handles {
+      let chunk = h
+        .join()
+        .map_err(|_| Error::store("compaction reader panicked"))??;
+      all.extend(chunk);
+    }
+    Ok(all)
+  })
+}
+
 /// Merge every segment of a partition into one fresh segment. The caller must
 /// hold both the partition write lock and the global write lock.
 fn compact_partition_locked(
@@ -524,10 +569,11 @@ fn compact_partition_locked(
     return Ok(None);
   }
 
-  // 1. fold all segments newest -> oldest into a single decision map.
+  // 1. fetch all segments in parallel, then fold newest -> oldest into a
+  //    single decision map (newest entry wins for each key).
+  let all = read_segments_parallel(store, &prefix, &ps.name, &ps.meta.segments)?;
   let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-  for seg in ps.meta.segments.iter().rev() {
-    let entries = read_segment_entries(store, &prefix, &ps.name, seg)?;
+  for entries in all.into_iter().rev() {
     for (k, v) in entries {
       map.entry(k).or_insert(v);
     }
