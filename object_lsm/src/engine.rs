@@ -511,6 +511,15 @@ fn read_segment_entries(
   Ok(out)
 }
 
+/// Snapshot of segments being compacted by a detached job.
+struct DetachedCompact {
+  prefix: String,
+  segs: Vec<SegmentMeta>,
+  segment_id: u64,
+  embed_index: bool,
+  block_size: usize,
+}
+
 /// Read all `segs` in bounded parallel batches, preserving segment order.
 ///
 /// Compaction consumes every block of every segment, so the R2/S3 latency is
@@ -556,6 +565,24 @@ fn read_segments_parallel(
   })
 }
 
+/// Fold all segment entry lists (ordered newest first) into one live map and
+/// return the merged, tombstone-free entries.
+fn merge_entries(all: Vec<SegmentEntries>) -> SegmentEntries {
+  let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+  for entries in all.into_iter().rev() {
+    for (k, v) in entries {
+      map.entry(k).or_insert(v);
+    }
+  }
+  let mut out: SegmentEntries = Vec::with_capacity(map.len());
+  for (k, v) in map {
+    if let Some(val) = v {
+      out.push((k, Some(val)));
+    }
+  }
+  out
+}
+
 /// Merge every segment of a partition into one fresh segment. The caller must
 /// hold both the partition write lock and the global write lock.
 fn compact_partition_locked(
@@ -572,20 +599,7 @@ fn compact_partition_locked(
   // 1. fetch all segments in parallel, then fold newest -> oldest into a
   //    single decision map (newest entry wins for each key).
   let all = read_segments_parallel(store, &prefix, &ps.name, &ps.meta.segments)?;
-  let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-  for entries in all.into_iter().rev() {
-    for (k, v) in entries {
-      map.entry(k).or_insert(v);
-    }
-  }
-
-  // 2. drop tombstones: nothing older than the merged run survives.
-  let mut out: SegmentEntries = Vec::with_capacity(map.len());
-  for (k, v) in map {
-    if let Some(val) = v {
-      out.push((k, Some(val)));
-    }
-  }
+  let out = merge_entries(all);
 
   // 3. upload the merged result first (failure keeps the old run intact),
   //    then atomically swap the segment list and publish the manifest. Old
@@ -841,6 +855,20 @@ impl Inner {
     self.partitions.get(name)
   }
 
+  /// Wait for any in-flight detached compaction on `name` to finish.
+  fn wait_compaction_finished(&self, name: &str) {
+    loop {
+      let Some(lock) = self.partitions.get(name) else {
+        return;
+      };
+      if !lock.read().compacting {
+        return;
+      }
+      drop(lock);
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+  }
+
   fn ensure_partitions(&self, names: &[String]) {
     for name in names {
       self.partitions.create(name);
@@ -935,7 +963,7 @@ impl Inner {
       ps.apply(&op.key, op.value.as_deref());
     }
 
-    let mut deleted: Vec<(String, Vec<SegmentMeta>)> = Vec::new();
+    let mut to_compact: Vec<String> = Vec::new();
     {
       let mut st = self.state.write();
       let mem_limit = st.cfg.max_memtable_bytes;
@@ -960,21 +988,21 @@ impl Inner {
         }
       }
 
+      // Do not run compaction while holding the partition/global locks. Only
+      // mark partitions that need it and run the detached compaction after the
+      // commit guards are released.
       let seg_limit = st.cfg.max_segments_before_compact;
       for name in &names {
         let ps = guards.get_mut(name).expect("guard");
-        if !ps.meta.dropped
-          && ps.meta.segments.len() >= seg_limit
-          && let Ok(Some(old)) = compact_partition_locked(&*self.store, &mut st, ps)
-        {
-          deleted.push((name.clone(), old));
+        if !ps.meta.dropped && !ps.compacting && ps.meta.segments.len() >= seg_limit {
+          to_compact.push(name.clone());
         }
       }
       gc_journal(&*self.store, &mut st);
     }
     drop(guards);
-    for (name, old) in deleted {
-      self.delete_old_segments(&name, old);
+    for name in to_compact {
+      self.compact_partition_detached(&name)?;
     }
     Ok(())
   }
@@ -1114,6 +1142,7 @@ impl Inner {
     // publish the cleared manifest before deleting old objects: a crash only
     // leaves orphan objects, never a manifest pointing at deleted segments.
     let _del = self.readers.exclusive();
+    self.wait_compaction_finished(name);
     let Some(lock) = self.partition_lock(name) else {
       return Ok(());
     };
@@ -1143,6 +1172,7 @@ impl Inner {
   pub(crate) fn rm_partition(&self, name: &str) -> Result<()> {
     self.ensure_writer()?;
     let _del = self.readers.exclusive();
+    self.wait_compaction_finished(name);
     let Some(lock) = self.partition_lock(name) else {
       return Ok(());
     };
@@ -1172,23 +1202,7 @@ impl Inner {
   /// Flush + merge-compact a single partition.
   pub(crate) fn compact_partition(&self, name: &str) -> Result<()> {
     self.ensure_writer()?;
-    if self.state.read().pending_flushes.contains_key(name) {
-      finish_partition_flush(self, name)?;
-    }
-    let Some(lock) = self.partition_lock(name) else {
-      return Ok(());
-    };
-    let old = {
-      let mut ps = lock.write();
-      let mut st = self.state.write();
-      let old = compact_partition_locked(&*self.store, &mut st, &mut ps)?;
-      gc_journal(&*self.store, &mut st);
-      old
-    };
-    if let Some(old) = old {
-      self.delete_old_segments(name, old);
-    }
-    Ok(())
+    self.compact_partition_detached(name)
   }
 
   /// Flush + merge-compact every non-dropped partition.
@@ -1200,24 +1214,160 @@ impl Inner {
     }
     let names = self.partitions.names();
     for name in names {
-      let Some(lock) = self.partition_lock(&name) else {
-        continue;
-      };
-      let old = {
-        let mut ps = lock.write();
-        let mut st = self.state.write();
-        let old = if !ps.meta.dropped && (!ps.mem.is_empty() || ps.meta.segments.len() > 1) {
-          compact_partition_locked(&*self.store, &mut st, &mut ps)?
-        } else {
-          None
+      self.compact_partition_detached(&name)?;
+    }
+    Ok(())
+  }
+
+  /// Flush a partition memtable using the detached upload pipeline so the
+  /// segment PUT does not happen while any partition/global lock is held.
+  fn flush_partition_detached(&self, part: &str) -> Result<()> {
+    if self.state.read().pending_flushes.contains_key(part) {
+      finish_partition_flush(self, part)?;
+    }
+    loop {
+      let pending = {
+        let Some(lock) = self.partition_lock(part) else {
+          return Ok(());
         };
-        gc_journal(&*self.store, &mut st);
-        old
+        let mut ps = lock.write();
+        if ps.mem.is_empty() {
+          return Ok(());
+        }
+        let mut st = self.state.write();
+        let entries: SegmentEntries = ps
+          .mem
+          .iter()
+          .map(|(k, e)| {
+            let v = match e {
+              MemEntry::Value(v) => Some(v.clone()),
+              MemEntry::Tombstone => None,
+            };
+            (k.clone(), v)
+          })
+          .collect();
+        let encoded = encode_segment(&entries, st.cfg.block_size as usize)?;
+        let segment_id = st.next_segment_id;
+        st.next_segment_id += 1;
+        let pending = PendingFlush {
+          partition: ps.name.clone(),
+          watermark: ps.meta.watermark.max(st.journal_seq),
+          segment_id,
+          encoded,
+          entries,
+        };
+        st.pending_flushes.insert(part.to_string(), pending.clone());
+        ps.mem.clear();
+        ps.mem_bytes = 0;
+        Some(pending)
       };
-      if let Some(old) = old {
-        self.delete_old_segments(&name, old);
+      if let Some(pending) = pending {
+        finish_partition_flush(self, &pending.partition)?;
       }
     }
+  }
+
+  /// Compact one partition without holding the partition/global lock during
+  /// the remote reads or the merged-segment upload. The compaction is marked
+  /// in-flight under a brief write lock, runs remote I/O outside, then applies
+  /// the result under a brief write lock.
+  pub(crate) fn compact_partition_detached(&self, part: &str) -> Result<()> {
+    self.flush_partition_detached(part)?;
+    let Some(begin) = ({
+      let Some(lock) = self.partition_lock(part) else {
+        return Ok(());
+      };
+      let mut ps = lock.write();
+      if ps.compacting || ps.meta.dropped || ps.meta.segments.len() < 2 {
+        return Ok(());
+      }
+      let mut st = self.state.write();
+      let segs = ps.meta.segments.clone();
+      let begin = DetachedCompact {
+        prefix: st.cfg.prefix.clone(),
+        segs,
+        segment_id: st.next_segment_id,
+        embed_index: st.cfg.manifest_embed_index,
+        block_size: st.cfg.block_size as usize,
+      };
+      st.next_segment_id += 1;
+      ps.compacting = true;
+      Some(begin)
+    }) else {
+      return Ok(());
+    };
+
+    // Remote I/O while no partition/global lock is held.
+    let remote_result: Result<Option<SegmentMeta>> = (|| {
+      let all = read_segments_parallel(&*self.store, &begin.prefix, part, &begin.segs)?;
+      let out = merge_entries(all);
+      if out.is_empty() {
+        return Ok(None);
+      }
+      let encoded = encode_segment(&out, begin.block_size)?;
+      let key = segment_key(&begin.prefix, part, begin.segment_id);
+      self.store.put(&key, &encoded)?;
+      Ok(Some(build_segment_meta(
+        begin.segment_id,
+        begin.segs.last().map(|s| s.seq).unwrap_or(0),
+        &encoded,
+        &out,
+        begin.embed_index,
+      )?))
+    })();
+    let merged = match remote_result {
+      Ok(m) => m,
+      Err(e) => {
+        if let Some(lock) = self.partition_lock(part) {
+          lock.write().compacting = false;
+        }
+        return Err(e);
+      }
+    };
+
+    let old_ids: std::collections::BTreeSet<u64> = begin.segs.iter().map(|s| s.id).collect();
+    let removed = {
+      let Some(lock) = self.partition_lock(part) else {
+        if let Some(m) = &merged {
+          let _ = self.store.delete(&segment_key(&begin.prefix, part, m.id));
+        }
+        return Ok(());
+      };
+      let mut ps = lock.write();
+      if !ps.compacting {
+        if let Some(m) = &merged {
+          let _ = self.store.delete(&segment_key(&begin.prefix, part, m.id));
+        }
+        return Ok(());
+      }
+      ps.compacting = false;
+      let current_ids: std::collections::BTreeSet<u64> =
+        ps.meta.segments.iter().map(|s| s.id).collect();
+      if !old_ids.is_subset(&current_ids) {
+        if let Some(m) = &merged {
+          let _ = self.store.delete(&segment_key(&begin.prefix, part, m.id));
+        }
+        return Ok(());
+      }
+      let removed: Vec<SegmentMeta> = ps
+        .meta
+        .segments
+        .iter()
+        .filter(|s| old_ids.contains(&s.id))
+        .cloned()
+        .collect();
+      ps.meta.segments.retain(|s| !old_ids.contains(&s.id));
+      if let Some(m) = merged {
+        ps.meta.segments.insert(0, m);
+      }
+      let mut st = self.state.write();
+      sync_partition_meta(&mut st, &ps);
+      publish_manifest(&*self.store, &mut st)?;
+      gc_journal(&*self.store, &mut st);
+      st.compactions_completed += 1;
+      removed
+    };
+    self.delete_old_segments(part, removed);
     Ok(())
   }
 

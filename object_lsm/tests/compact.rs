@@ -1,6 +1,14 @@
 //! M3 tests: merge compaction, journal GC and orphan GC at open.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+  collections::BTreeMap,
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  thread,
+  time::{Duration, Instant},
+};
 
 use wedb_embed_engine::{Engine, KvEntry, Partition};
 use wedb_object_lsm::{
@@ -259,4 +267,82 @@ fn orphan_objects_gc_at_open() {
     1,
     "only the current manifest should survive, got {numeric:?}"
   );
+}
+
+#[test]
+fn detached_compaction_does_not_block_writes() {
+  // Build several small segments with a normal store first.
+  let base = MemoryStore::new();
+  let cfg_build = Config::new("m3/detached")
+    .max_memtable_bytes(40)
+    .block_size(64)
+    .max_segments_before_compact(1_000_000);
+  {
+    let db = ObjectLsm::open(Arc::new(base.clone()), cfg_build).unwrap();
+    let p = db.partition("data").unwrap();
+    for i in 0..N {
+      p.insert(&key(i), format!("v{i}").as_bytes()).unwrap();
+    }
+  }
+
+  struct BlockingGetStore {
+    inner: MemoryStore,
+    seg_gets: Arc<AtomicUsize>,
+  }
+  impl Store for BlockingGetStore {
+    fn get(&self, key: &str) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+      if key.contains("/seg/") && self.seg_gets.fetch_add(1, Ordering::SeqCst) == 0 {
+        thread::sleep(Duration::from_millis(300));
+      }
+      self.inner.get(key)
+    }
+    fn get_range(
+      &self,
+      key: &str,
+      offset: u64,
+      len: u64,
+    ) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+      self.inner.get_range(key, offset, len)
+    }
+    fn put(&self, key: &str, data: &[u8]) -> wedb_object_lsm::Result<()> {
+      self.inner.put(key, data)
+    }
+    fn delete(&self, key: &str) -> wedb_object_lsm::Result<()> {
+      self.inner.delete(key)
+    }
+    fn list(&self, prefix: &str) -> wedb_object_lsm::Result<Vec<String>> {
+      self.inner.list(prefix)
+    }
+  }
+
+  let seg_gets = Arc::new(AtomicUsize::new(0));
+  let store = Arc::new(BlockingGetStore {
+    inner: base,
+    seg_gets: seg_gets.clone(),
+  });
+  let db = ObjectLsm::open(
+    store,
+    Config::new("m3/detached")
+      .max_memtable_bytes(1 << 20)
+      .block_size(64)
+      .max_segments_before_compact(1_000_000),
+  )
+  .unwrap();
+  let p = db.partition("data").unwrap();
+  let cdb = db.clone();
+  let compactor = thread::spawn(move || cdb.compact().unwrap());
+  while seg_gets.load(Ordering::SeqCst) == 0 {
+    thread::sleep(Duration::from_millis(5));
+  }
+  let started = Instant::now();
+  p.insert(b"z-concurrent", b"new").unwrap();
+  assert!(
+    started.elapsed() < Duration::from_millis(200),
+    "write blocked while compaction reads segments"
+  );
+  compactor.join().unwrap();
+  assert_eq!(p.table_count(), 1, "compaction must merge");
+  assert_eq!(p.get(&key(3)).unwrap().unwrap(), b"v3");
+  assert_eq!(p.get(b"z-concurrent").unwrap().unwrap(), b"new");
+  drop(db);
 }

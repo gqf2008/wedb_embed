@@ -42,6 +42,8 @@ pub struct PartitionState {
   pub mem_bytes: u64,
   /// Flushed immutable segments + durable metadata.
   pub meta: PartitionMeta,
+  /// A detached compaction is in flight for this partition.
+  pub compacting: bool,
 }
 
 impl PartitionState {
@@ -51,6 +53,7 @@ impl PartitionState {
       mem: BTreeMap::new(),
       mem_bytes: 0,
       meta: PartitionMeta::default(),
+      compacting: false,
     }
   }
 
