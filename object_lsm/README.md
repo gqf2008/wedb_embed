@@ -41,6 +41,8 @@ write-adjacent maintenance:
 - [x] M3 compaction + orphan GC + journal GC
 - [x] M4 compatibility harness vs `wedb_embed` tests + benchmarks
 - [x] R2/S3 remote `Store` backend (feature `r2`, `object_store` sync bridge)
+- [x] P2 HA: non-blocking lease + standby promotion (`try_open_leased`), fencing,
+      and cross-epoch recovery of acked-but-unflushed journals after a leader crash
 
 ## Test
 
@@ -147,12 +149,51 @@ unchanged. `MemoryStore` compares bytes directly; `R2Store` maps it to S3
 monotonic **fencing epoch** embedded in every journal group and in the
 manifest; manifest publishing performs a conditional update of the `current`
 pointer (CAS), so only one epoch's state is ever visible, and recovery ignores
-journal groups from a different epoch. On writer handoff, unflushed
-old-epoch journal groups are fenced off — call `compact`/`persist` before
-releasing the lease to make state durable across a takeover. Lost-lease
-detection remains heartbeat-based. Each shard is a separate engine instance —
+journal groups from a different epoch. Once a manifest exists, a takeover
+replays only the journals of the epoch recorded in `current` (older epochs are
+fenced off); before the first manifest publish the successor replays every
+epoch's journals, so a crash right after acking never loses data (see HA
+section below). For a *graceful* handoff, call `compact`/`persist` before
+releasing the lease so the state is fully folded. Lost-lease detection remains
+heartbeat-based. Each shard is a separate engine instance —
 cross-shard queries/cluster routing stay an application concern (as in Redis
 Cluster).
+
+### HA: automatic failover of a crashed writer
+
+Standby supervisors poll the lease without blocking instead of calling the
+blocking `open_leased`:
+
+```rust
+// one non-blocking attempt: Ok(None) while the active writer holds the lease
+if let Some(engine) = ObjectLsm::try_open_leased(store.clone(), cfg.clone(), opts)? {
+  // we won the lease and recovered the published state
+}
+```
+
+- `Lease::try_acquire_once` performs a single acquisition attempt (create-if-
+  absent, or CAS takeover of an expired lease); `acquire`/`open_leased` are now
+  thin retry loops over it.
+- `ObjectLsm::try_open_leased` combines "win the lease if free" with engine
+  recovery and bumps the fencing epoch; the same-prefix lease + manifest-CAS +
+  epoch rules guarantee exactly one writer (`concurrent_standbys_promote_
+  exactly_one_writer`).
+- **Pre-manifest recovery**: when a leader crashes after acknowledged writes
+  but before its *first* manifest publish, the successor replays every journal
+  object under `<prefix>/journal/` across epochs (sorted by seq), so acked
+  writes survive even though no manifest ever existed. Journals of superseded
+  epochs are fenced off once a manifest exists; old-epoch journal objects left
+  behind by repeated failovers can be reclaimed by an object-store lifecycle
+  rule (e.g. expire `*/journal/*` older than N days).
+- Live R2 test `r2_same_prefix_auto_failover_after_leader_crash`: leader writes
+  strict-mode keys (never flushed), crashes; a standby promotes after lease
+  expiry and recovers every acked key from real Cloudflare R2.
+
+Writer-handoff rule (unchanged): to make *all* acknowledged writes durable
+across a *graceful* handoff without relying on the new recovery path, call
+`persist()`/`compact()` before releasing the lease. Group-commit acks are
+buffered until the next flush and can be lost on a crash — the AOF-every-N-ms
+trade-off documented above.
 
 
 ## fjall-alignment notes

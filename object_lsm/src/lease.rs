@@ -119,60 +119,63 @@ impl std::fmt::Debug for Lease {
 impl Lease {
   /// Try to acquire the lease, retrying until `opts.timeout`.
   pub fn acquire(store: Arc<dyn Store>, prefix: &str, opts: LeaseOptions) -> Result<Self> {
-    let key = lease_key(prefix);
-    let ttl_ms = opts.ttl.as_millis().max(1);
-    let epoch = epoch_now();
     let deadline = Instant::now() + opts.timeout;
     loop {
-      match store.get(&key) {
-        Ok(None) => {
-          if store.create(&key, &payload(&opts.owner, ttl_ms, epoch))? {
-            // Verify we still own the lease; a concurrent stale-takeover may
-            // have deleted us already (best-effort fencing).
-            let owned = matches!(store.get(&key)?, Some(b) if parse_payload(&b).ok().map(|(o, _, _)| o) == Some(opts.owner.clone()));
-            if owned {
-              break;
-            }
-          }
-        }
-        Ok(Some(bytes)) => {
-          // Atomically take over an expired lease with compare-and-swap: it
-          // only succeeds if the object still holds the exact expired payload
-          // we just read, so two contenders cannot both win.
-          if let Ok((_, expiry, _)) = parse_payload(&bytes)
-            && expiry <= now_ms()
-            && store.put_if_matches(&key, &bytes, &payload(&opts.owner, ttl_ms, epoch))?
-          {
-            break;
-          }
-        }
-        Err(e) => return Err(e),
+      if let Some(lease) = Self::try_acquire_once(store.clone(), prefix, &opts)? {
+        return Ok(lease);
       }
       if Instant::now() >= deadline {
-        return Err(Error::store(format!("lease {key} held by another writer")));
+        return Err(Error::store(format!(
+          "lease {} held by another writer",
+          lease_key(prefix)
+        )));
       }
       thread::sleep(Duration::from_millis(50));
     }
+  }
 
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-    let inner = Arc::new(LeaseInner {
-      store: store.clone(),
-      key,
-      owner: opts.owner.clone(),
-      ttl_ms,
-      epoch,
-      stop: AtomicBool::new(false),
-      lost: Arc::new(AtomicBool::new(false)),
-      op: parking_lot::Mutex::new(()),
-      stop_tx: Some(stop_tx),
-    });
-    if opts.heartbeat {
-      spawn_heartbeat(inner.clone(), stop_rx);
-    } else {
-      // keep rx alive by storing nothing; drop
-      let _ = stop_rx;
+  /// One non-blocking acquisition attempt.
+  ///
+  /// Returns `Ok(Some(lease))` when this instance won the lease, `Ok(None)`
+  /// when another owner currently holds it (or a concurrent contender won the
+  /// race), and `Err` only on a store failure. A stale (expired) lease is
+  /// taken over atomically with a compare-and-swap so two contenders can never
+  /// both win. Standby/polling supervisors call this instead of [`Self::acquire`]
+  /// to avoid blocking for `opts.timeout` while the active writer is healthy.
+  pub fn try_acquire_once(
+    store: Arc<dyn Store>,
+    prefix: &str,
+    opts: &LeaseOptions,
+  ) -> Result<Option<Self>> {
+    let key = lease_key(prefix);
+    let ttl_ms = opts.ttl.as_millis().max(1);
+    let epoch = epoch_now();
+    match store.get(&key) {
+      Ok(None) => {
+        if store.create(&key, &payload(&opts.owner, ttl_ms, epoch))? {
+          // Verify we still own the lease; a concurrent stale-takeover may
+          // have deleted us already (best-effort fencing).
+          let owned = matches!(store.get(&key)?, Some(b) if parse_payload(&b).ok().map(|(o, _, _)| o) == Some(opts.owner.clone()));
+          if owned {
+            return Ok(Some(finish_acquire(store, key, opts, ttl_ms, epoch)));
+          }
+        }
+        Ok(None)
+      }
+      Ok(Some(bytes)) => {
+        // Atomically take over an expired lease with compare-and-swap: it only
+        // succeeds if the object still holds the exact expired payload we just
+        // read, so two contenders cannot both win.
+        if let Ok((_, expiry, _)) = parse_payload(&bytes)
+          && expiry <= now_ms()
+          && store.put_if_matches(&key, &bytes, &payload(&opts.owner, ttl_ms, epoch))?
+        {
+          return Ok(Some(finish_acquire(store, key, opts, ttl_ms, epoch)));
+        }
+        Ok(None)
+      }
+      Err(e) => Err(e),
     }
-    Ok(Self { inner })
   }
 
   pub fn owner(&self) -> &str {
@@ -242,6 +245,36 @@ impl Drop for Lease {
   fn drop(&mut self) {
     self.release();
   }
+}
+
+/// Build a [`Lease`] handle around a won acquisition and (optionally) start its
+/// background heartbeat renewal thread.
+fn finish_acquire(
+  store: Arc<dyn Store>,
+  key: String,
+  opts: &LeaseOptions,
+  ttl_ms: u128,
+  epoch: u128,
+) -> Lease {
+  let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+  let inner = Arc::new(LeaseInner {
+    store,
+    key,
+    owner: opts.owner.clone(),
+    ttl_ms,
+    epoch,
+    stop: AtomicBool::new(false),
+    lost: Arc::new(AtomicBool::new(false)),
+    op: parking_lot::Mutex::new(()),
+    stop_tx: Some(stop_tx),
+  });
+  if opts.heartbeat {
+    spawn_heartbeat(inner.clone(), stop_rx);
+  } else {
+    // Keep the receiver alive by dropping it; the sender simply fails to send.
+    let _ = stop_rx;
+  }
+  Lease { inner }
 }
 
 fn spawn_heartbeat(inner: Arc<LeaseInner>, stop_rx: std::sync::mpsc::Receiver<()>) {

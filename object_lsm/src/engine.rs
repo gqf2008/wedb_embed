@@ -9,7 +9,7 @@ use std::{
     atomic::{AtomicBool, Ordering},
   },
   thread,
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -22,10 +22,10 @@ use crate::{
   error::{Error, Result},
   journal::{Group, Op, decode_group_stream, encode_group},
   keys::{
-    current_key, journal_key_epoch, journal_prefix_epoch, manifest_key, manifest_prefix,
-    parse_tail_seq, segment_key, segment_root,
+    current_key, journal_key_epoch, journal_prefix, journal_prefix_epoch, manifest_key,
+    manifest_prefix, parse_journal_tail, parse_tail_seq, segment_key, segment_root,
   },
-  lease::{Lease, LeaseOptions},
+  lease::{Lease, LeaseOptions, lease_key},
   manifest::Manifest,
   partition::ObjectLsmPartition,
   segment::{
@@ -106,11 +106,43 @@ impl ObjectLsm {
   /// Open as the exclusive writer of `cfg.prefix`, acquiring an expiring
   /// object lease first (for multi-instance access to a shared bucket).
   ///
-  /// Fails once [`LeaseOptions::timeout`] elapses while another writer holds
-  /// the lease. The lease is renewed by a background heartbeat and released
-  /// when the last handle to this engine is dropped.
+  /// Blocks (polling every 50 ms) until the lease is free or
+  /// [`LeaseOptions::timeout`] elapses, then fails. The lease is renewed by a
+  /// background heartbeat and released when the last handle to this engine is
+  /// dropped.
   pub fn open_leased(store: Arc<dyn Store>, cfg: Config, opts: LeaseOptions) -> Result<Self> {
-    let lease = Lease::acquire(store.clone(), &cfg.prefix, opts)?;
+    let deadline = Instant::now() + opts.timeout;
+    loop {
+      if let Some(engine) = Self::try_open_leased(store.clone(), cfg.clone(), opts.clone())? {
+        return Ok(engine);
+      }
+      if Instant::now() >= deadline {
+        return Err(Error::store(format!(
+          "lease {} held by another writer",
+          lease_key(&cfg.prefix)
+        )));
+      }
+      thread::sleep(Duration::from_millis(50));
+    }
+  }
+
+  /// One non-blocking attempt to become the exclusive writer of `cfg.prefix`.
+  ///
+  /// Returns `Ok(Some(engine))` when this instance won the lease and the
+  /// engine recovered, `Ok(None)` while another writer holds the lease (or a
+  /// concurrent contender won the race), and `Err` on store/recovery failure
+  /// (the lease, if acquired, is released again). Standby supervisors poll
+  /// this to promote the next writer after the active one crashes: the fence
+  /// epoch is bumped on every acquisition, so a stale writer can never publish
+  /// after the takeover.
+  pub fn try_open_leased(
+    store: Arc<dyn Store>,
+    cfg: Config,
+    opts: LeaseOptions,
+  ) -> Result<Option<Self>> {
+    let Some(lease) = Lease::try_acquire_once(store.clone(), &cfg.prefix, &opts)? else {
+      return Ok(None);
+    };
     let mut engine = Self::build(store, cfg)?;
     {
       let mut st = engine.inner.state.write();
@@ -118,7 +150,15 @@ impl ObjectLsm {
     }
     *engine.inner.lease_lost.lock() = Some(lease.lost_flag());
     engine.lease = Some(Arc::new(lease));
-    Ok(engine)
+    Ok(Some(engine))
+  }
+
+  /// Fencing epoch of this instance (`0` for unfenced engines). Bumped on
+  /// every lease acquisition; embedded in journal groups and manifest
+  /// publishes so a stale writer's state can never become visible after a
+  /// takeover.
+  pub fn fence_epoch(&self) -> u128 {
+    self.inner.state.read().fence_epoch
   }
 
   fn build(store: Arc<dyn Store>, cfg: Config) -> Result<Self> {
@@ -228,13 +268,43 @@ fn recover(
   }
 
   // Replay every journal group newer than its partition watermark.
-  let list = store.list(&journal_prefix_epoch(prefix, st.fence_epoch))?;
+  //
+  // When a manifest exists, only the journals of the epoch recorded in
+  // `current` are replayed: a takeover bumps the fencing epoch, so a stale
+  // writer's objects can never become visible again. When NO manifest has
+  // ever been published, the previous writer crashed before its first flush
+  // and its committed journals are still the only durable record, so we
+  // replay every journal object under `<prefix>/journal/` across epochs
+  // (sorted by seq) — a successor therefore recovers all acked writes, not
+  // just the ones already folded into segments.
+  let has_manifest = st.current_bytes.is_some();
+  let (list, root) = if has_manifest {
+    (
+      store.list(&journal_prefix_epoch(prefix, st.fence_epoch))?,
+      None,
+    )
+  } else {
+    (
+      store.list(&journal_prefix(prefix))?,
+      Some(journal_prefix(prefix)),
+    )
+  };
   let mut max_seq = st.journal_seq;
+  let mut pending: Vec<(String, u64)> = Vec::new();
   for k in &list {
-    if let Some(s) = parse_tail_seq(k) {
-      max_seq = max_seq.max(s);
-      st.journal_seqs.insert(s);
-    }
+    let s = match &root {
+      Some(root) => match parse_journal_tail(k, root) {
+        Some((_, s)) => s,
+        None => continue,
+      },
+      None => match parse_tail_seq(k) {
+        Some(s) => s,
+        None => continue,
+      },
+    };
+    max_seq = max_seq.max(s);
+    st.journal_seqs.insert(s);
+    pending.push((k.clone(), s));
   }
   st.journal_seq = max_seq;
   let min_wm = st
@@ -243,20 +313,19 @@ fn recover(
     .map(|p| p.watermark)
     .min()
     .unwrap_or(0);
-  let mut seqs: Vec<u64> = list.iter().filter_map(|k| parse_tail_seq(k)).collect();
-  seqs.sort_unstable();
-  for s in seqs {
+  pending.sort_by_key(|(_, s)| *s);
+  for (key, s) in pending {
     // Groups in an object whose end-seq is at/below every partition watermark
     // are already folded into durable segments; skip the whole object.
     if s <= min_wm {
       continue;
     }
-    let Some(bytes) = store.get(&journal_key_epoch(prefix, s, st.fence_epoch))? else {
+    let Some(bytes) = store.get(&key)? else {
       continue;
     };
     st.journal_sizes.insert(s, bytes.len() as u64);
     for group in decode_group_stream(&bytes)? {
-      if group.epoch != st.fence_epoch {
+      if has_manifest && group.epoch != st.fence_epoch {
         continue;
       }
       apply_group_recover(&mut st, &group, partitions)?;

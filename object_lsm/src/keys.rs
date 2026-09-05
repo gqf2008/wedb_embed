@@ -59,6 +59,16 @@ pub fn manifest_prefix(prefix: &str) -> String {
   format!("{prefix}/manifest/")
 }
 
+/// Parse the tail of a journal object key below the fixed `<prefix>/journal/`
+/// root: either `<seq:020>` (legacy unfenced layout) or `<epoch>/<seq:020>`
+/// (epoch-namespaced layout used by leased writers).
+pub fn parse_journal_tail(key: &str, root: &str) -> Option<(u128, u64)> {
+  let tail = key.strip_prefix(root)?;
+  match tail.split_once('/') {
+    Some((epoch, seq)) => Some((epoch.parse().ok()?, seq.parse().ok()?)),
+    None => Some((0, tail.parse().ok()?)),
+  }
+}
 /// Extract the trailing numeric sequence from a key like `<...>/<seq:020>`.
 pub fn parse_tail_seq(key: &str) -> Option<u64> {
   let (_, tail) = key.rsplit_once('/')?;

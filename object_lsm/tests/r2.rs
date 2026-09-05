@@ -353,3 +353,99 @@ fn r2_transient_segment_put_failure_keeps_old_run() -> wedb_object_lsm::Result<(
   }
   Ok(())
 }
+
+/// Live multi-instance HA: a leader crashes (lease left to expire) after
+/// acknowledged strict-mode writes that were never flushed to a manifest; a
+/// standby polls `try_open_leased` and promotes once the lease expires. The
+/// successor must recover the leader's pre-manifest journals on real R2, then
+/// keep writing under its own epoch.
+#[test]
+fn r2_same_prefix_auto_failover_after_leader_crash() -> wedb_object_lsm::Result<()> {
+  if !env_ok() {
+    eprintln!("R2 env not configured; skipping live test");
+    return Ok(());
+  }
+  let prefix = prefix();
+  let cfg = Config::new(&prefix)
+    .max_memtable_bytes(1 << 20)
+    .max_segments_before_compact(1_000_000);
+  let leader_opts = LeaseOptions {
+    owner: "w0".into(),
+    ttl: std::time::Duration::from_secs(10),
+    timeout: std::time::Duration::from_millis(1_000),
+    heartbeat: false,
+  };
+  let standby_opts = LeaseOptions {
+    owner: "w1".into(),
+    ttl: std::time::Duration::from_secs(300),
+    timeout: std::time::Duration::from_millis(1_000),
+    heartbeat: false,
+  };
+
+  let store = Arc::new(R2Store::from_env()?);
+  let leader = ObjectLsm::try_open_leased(store.clone(), cfg.clone(), leader_opts.clone())?
+    .expect("first writer must win the lease");
+  // The standby observes the held lease without blocking (checked immediately,
+  // before the write phase could let a short un-renewed lease lapse).
+  assert!(
+    ObjectLsm::try_open_leased(store.clone(), cfg.clone(), standby_opts.clone())?.is_none(),
+    "standby must be refused while the leader holds the lease"
+  );
+  let p = leader.partition("data")?;
+  let n = 5u32;
+  for i in 0..n {
+    p.insert(format!("w0-{i:03}").as_bytes(), format!("v{i}").as_bytes())?;
+  }
+  // ...then the leader crashes without releasing it (lease expires in ~10 s).
+  std::mem::forget(leader);
+  std::mem::forget(p);
+
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+  let standby = loop {
+    if let Some(e) = ObjectLsm::try_open_leased(store.clone(), cfg.clone(), standby_opts.clone())? {
+      break e;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "standby never promoted on R2"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(250));
+  };
+
+  // The successor recovered every acked pre-manifest journal of the old epoch.
+  let p2 = standby.partition("data")?;
+  assert_eq!(
+    p2.len()?,
+    n as usize,
+    "successor must recover the crashed leader's acked writes on R2"
+  );
+  assert_eq!(p2.get(b"w0-000")?.unwrap(), b"v0");
+  assert_eq!(
+    p2.get(format!("w0-{:03}", n - 1).as_bytes())?.unwrap(),
+    format!("v{}", n - 1).into_bytes()
+  );
+
+  // The new epoch keeps writing and folds everything into one manifest.
+  for i in 0..n {
+    p2.insert(
+      format!("w1-{i:03}").as_bytes(),
+      format!("v{}", n + i).as_bytes(),
+    )?;
+  }
+  standby.compact()?;
+  drop(standby);
+  drop(p2);
+
+  // Reopen and verify both writers' data is durable.
+  let store2 = Arc::new(R2Store::from_env()?);
+  let e2 = ObjectLsm::open(store2.clone(), cfg)?;
+  let p3 = e2.partition("data")?;
+  assert_eq!(p3.len()?, 2 * n as usize);
+  assert_eq!(p3.get(b"w0-000")?.unwrap(), b"v0");
+  assert_eq!(p3.get(b"w1-000")?.unwrap(), b"v5");
+
+  for key in store2.list(&prefix)? {
+    let _ = store2.delete(&key);
+  }
+  Ok(())
+}
