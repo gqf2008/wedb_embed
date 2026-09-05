@@ -63,7 +63,7 @@ fn metrics_track_ops_errors_and_storage() {
 
   let m = db.metrics();
   assert_eq!(m.commits, 4);
-  assert_eq!(m.commit_errors, 1);
+  assert_eq!(m.commit_failures, 1);
   assert_eq!(m.puts, 2);
   assert_eq!(m.deletes, 1);
   assert_eq!(m.gets, 2);

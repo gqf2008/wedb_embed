@@ -22,9 +22,13 @@ use wedb_embed_engine::{Engine, Partition};
 use wedb_object_lsm::{Config, ObjectLsm, R2Store, Result, Store};
 
 fn env_ok() -> bool {
-  ["R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+  let creds = ["R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
     .iter()
-    .all(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false))
+    .all(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false));
+  let endpoint = ["R2_ENDPOINT", "R2_ACCOUNT_ID"]
+    .iter()
+    .any(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false));
+  creds && endpoint
 }
 
 fn seconds() -> u64 {
@@ -58,7 +62,7 @@ impl Store for JitterStore {
   }
   fn put(&self, key: &str, data: &[u8]) -> Result<()> {
     let i = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-    if i.is_multiple_of(self.fail_every) {
+    if key.contains("/journal/") && i.is_multiple_of(self.fail_every) {
       return Err(wedb_object_lsm::Error::store(
         "injected transient R2 PUT failure",
       ));

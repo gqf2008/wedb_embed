@@ -49,7 +49,7 @@ impl ObjectLsm {
 }
 
 pub use error::{Error, Result};
-pub use metrics::{Metrics, MetricsSnapshot};
+pub use metrics::MetricsSnapshot;
 pub use partition::{ObjectLsmEntry, ObjectLsmIter, ObjectLsmPartition};
 pub use store::{MemoryStore, Store};
 

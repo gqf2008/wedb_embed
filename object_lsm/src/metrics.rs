@@ -8,6 +8,7 @@ use std::sync::{
 };
 
 /// Cumulative operation counters (atomic, cheap to bump from hot paths).
+/// Public users interact with [`MetricsSnapshot`], not this type.
 #[derive(Clone, Default)]
 pub struct Metrics {
   inner: Arc<MetricsInner>,
@@ -16,21 +17,26 @@ pub struct Metrics {
 #[derive(Default)]
 struct MetricsInner {
   commits: AtomicU64,
-  commit_errors: AtomicU64,
+  commit_failures: AtomicU64,
   puts: AtomicU64,
   deletes: AtomicU64,
   gets: AtomicU64,
   refreshes: AtomicU64,
 }
 
-/// A point-in-time, plain-value snapshot returned by [`Metrics::snapshot`].
+/// A point-in-time, plain-value snapshot returned by [`crate::ObjectLsm::metrics`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
+  /// Commit attempts that passed the writer gate and entered the commit
+  /// pipeline (a journal PUT failure is still counted here).
   pub commits: u64,
-  pub commit_errors: u64,
+  /// Strict-mode journal-object PUT failures: the write was NOT acknowledged
+  /// and must be retried by the caller.
+  pub commit_failures: u64,
   pub puts: u64,
   pub deletes: u64,
   pub gets: u64,
+  /// Follower snapshot refreshes (always 0 for a writer).
   pub refreshes: u64,
   pub journal_count: usize,
   pub journal_bytes: u64,
@@ -44,8 +50,8 @@ impl Metrics {
     self.inner.commits.fetch_add(1, Ordering::Relaxed);
   }
 
-  pub(crate) fn bump_commit_error(&self) {
-    self.inner.commit_errors.fetch_add(1, Ordering::Relaxed);
+  pub(crate) fn bump_commit_failure(&self) {
+    self.inner.commit_failures.fetch_add(1, Ordering::Relaxed);
   }
 
   pub(crate) fn bump_puts(&self, n: u64) {
@@ -69,7 +75,7 @@ impl Metrics {
   pub(crate) fn counters(&self) -> MetricsSnapshot {
     MetricsSnapshot {
       commits: self.inner.commits.load(Ordering::Relaxed),
-      commit_errors: self.inner.commit_errors.load(Ordering::Relaxed),
+      commit_failures: self.inner.commit_failures.load(Ordering::Relaxed),
       puts: self.inner.puts.load(Ordering::Relaxed),
       deletes: self.inner.deletes.load(Ordering::Relaxed),
       gets: self.inner.gets.load(Ordering::Relaxed),

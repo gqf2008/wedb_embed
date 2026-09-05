@@ -204,9 +204,14 @@ impl ObjectLsm {
   /// production observability.
   pub fn metrics(&self) -> MetricsSnapshot {
     let mut m = self.inner.metrics.counters();
-    let st = self.inner.state.read();
-    m.journal_count = st.journal_seqs.len();
-    m.journal_bytes = st.journal_sizes.values().copied().sum();
+    // Never hold the global state lock while taking partition locks: the
+    // engine lock order is partition -> state, so nesting them here would
+    // deadlock against a concurrent commit. The snapshot is point-in-time-ish.
+    {
+      let st = self.inner.state.read();
+      m.journal_count = st.journal_seqs.len();
+      m.journal_bytes = st.journal_sizes.values().copied().sum();
+    }
     let mut segments = 0usize;
     let mut segment_bytes = 0u64;
     let mut memtable_bytes = 0u64;
@@ -1440,8 +1445,8 @@ impl Inner {
     if ops.is_empty() {
       return Ok(());
     }
-    self.metrics.bump_commit();
     self.ensure_writable()?;
+    self.metrics.bump_commit();
     let mut names: Vec<String> = ops.iter().map(|op| op.part.clone()).collect();
     names.sort();
     names.dedup();
@@ -1494,7 +1499,7 @@ impl Inner {
       {
         let _guard = self.journal_lock.lock();
         if let Err(e) = self.store.put(&jkey, &bytes) {
-          self.metrics.bump_commit_error();
+          self.metrics.bump_commit_failure();
           return Err(e);
         }
       }
