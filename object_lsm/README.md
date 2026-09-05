@@ -262,3 +262,31 @@ writing to the store:
 
 Live R2 test `r2_follower_reads_shared_bucket_prefix` verifies the read-replica
 topology on real Cloudflare R2.
+
+### Two processes on one bucket (sharded writers + cross readers)
+
+"Two processes read and write the same bucket" is supported with an explicit
+topology: each process owns a disjoint shard prefix as its exclusive leased
+writer and reads the other shards through followers.
+
+```rust
+// process A: owns shard-0, reads shard-1 via a follower
+let writer_a = ObjectLsm::open_leased(store.clone(), Config::for_shard("myapp/db", 0), lease("A"))?;
+let reader_of_b = ObjectLsm::open_follower(store.clone(), Config::for_shard("myapp/db", 1), poll)?;
+// process B: owns shard-1, reads shard-0 via a follower
+let writer_b = ObjectLsm::open_leased(store.clone(), Config::for_shard("myapp/db", 1), lease("B"))?;
+```
+
+Consistency model: per-shard writes are strongly consistent under the
+single-writer lease + epoch fencing (a second writer on the same prefix is
+rejected; a crashed writer is taken over without data loss). Cross-shard reads
+are eventually consistent — a follower converges to the other writer's
+*published* state on each refresh. Nothing is ever overwritten or lost across
+the two processes. Verified offline
+(`two_writers_share_bucket_with_cross_read_consistency`) and live on real
+Cloudflare R2 (`r2_two_writers_one_bucket_cross_reads`).
+
+For "two processes writing the SAME prefix simultaneously": that is rejected by
+design — the lease + fencing guarantee exactly one writer per prefix, which is
+what makes the single-prefix data strongly consistent (use shards or a
+failover/supervisor if you need a second writer on one prefix).

@@ -521,3 +521,86 @@ fn r2_follower_reads_shared_bucket_prefix() -> wedb_object_lsm::Result<()> {
   }
   Ok(())
 }
+
+/// Two processes (separate engine instances) sharing ONE real R2 bucket: each
+/// owns a disjoint shard prefix as a leased writer, writes concurrently, and
+/// reads the other process's published data through a follower on that shard.
+/// Verifies per-shard durability + cross-shard read convergence with no lost
+/// or mixed keys.
+#[test]
+fn r2_two_writers_one_bucket_cross_reads() -> wedb_object_lsm::Result<()> {
+  if !env_ok() {
+    eprintln!("R2 env not configured; skipping live test");
+    return Ok(());
+  }
+  let base = prefix(); // unique base; shards live under <base>/shard-N
+  let mk = |shard: u64| {
+    Config::for_shard(&base, shard)
+      .max_memtable_bytes(1 << 20)
+      .max_segments_before_compact(1_000_000)
+  };
+  let cfg_a = mk(0);
+  let cfg_b = mk(1);
+  let opts = |owner: &str| LeaseOptions {
+    owner: owner.into(),
+    ttl: std::time::Duration::from_secs(300),
+    timeout: std::time::Duration::from_millis(1_000),
+    heartbeat: false,
+  };
+
+  let store = Arc::new(R2Store::from_env()?);
+  let a = ObjectLsm::open_leased(store.clone(), cfg_a.clone(), opts("procA"))?;
+  let b = ObjectLsm::open_leased(store.clone(), cfg_b.clone(), opts("procB"))?;
+  let pa = a.partition("data")?;
+  let pb = b.partition("data")?;
+  let n = 5u32;
+  for i in 0..n {
+    pa.insert(format!("a-{i:02}").as_bytes(), format!("va{i}").as_bytes())?;
+    pb.insert(format!("b-{i:02}").as_bytes(), format!("vb{i}").as_bytes())?;
+  }
+  a.compact()?;
+  b.compact()?;
+
+  // Each process reads the other's published data via a follower on real R2.
+  let follower_a = ObjectLsm::open_follower(Arc::new(R2Store::from_env()?), cfg_b.clone(), None)?;
+  follower_a.refresh()?;
+  let pfb = follower_a.partition("data")?;
+  assert_eq!(pfb.len()?, n as usize, "A sees B's keys");
+  assert_eq!(pfb.get(b"b-04")?.unwrap(), b"vb4");
+
+  let follower_b = ObjectLsm::open_follower(Arc::new(R2Store::from_env()?), cfg_a.clone(), None)?;
+  follower_b.refresh()?;
+  let pfa = follower_b.partition("data")?;
+  assert_eq!(pfa.len()?, n as usize, "B sees A's keys");
+
+  // A keeps writing; B's follower converges.
+  for i in n..n + 3 {
+    pa.insert(format!("a-{i:02}").as_bytes(), format!("va{i}").as_bytes())?;
+  }
+  a.compact()?;
+  follower_b.refresh()?;
+  assert_eq!(pfa.len()?, (n + 3) as usize, "B's follower converges on A");
+  assert_eq!(pfa.get(b"a-07")?.unwrap(), b"va7");
+
+  drop(pa);
+  drop(pb);
+  drop(a);
+  drop(b);
+  drop(follower_a);
+  drop(follower_b);
+
+  // Reopen each shard and verify nothing was lost or mixed.
+  let ra = ObjectLsm::open(Arc::new(R2Store::from_env()?), cfg_a)?;
+  let p_ra = ra.partition("data")?;
+  assert_eq!(p_ra.len()?, (n + 3) as usize);
+  let rb = ObjectLsm::open(Arc::new(R2Store::from_env()?), cfg_b)?;
+  let p_rb = rb.partition("data")?;
+  assert_eq!(p_rb.len()?, n as usize);
+  assert_eq!(p_rb.get(b"b-00")?.unwrap(), b"vb0");
+
+  let store2 = Arc::new(R2Store::from_env()?);
+  for key in store2.list(&base)? {
+    let _ = store2.delete(&key);
+  }
+  Ok(())
+}

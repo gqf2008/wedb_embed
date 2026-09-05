@@ -438,3 +438,98 @@ fn follower_stale_read_errors_after_leader_deletes_segment() {
   assert_eq!(pf.get(b"k001").unwrap().unwrap(), b"v1");
   assert_eq!(pf.get(b"k007").unwrap().unwrap(), b"v7");
 }
+
+/// Two processes sharing ONE bucket: each owns a disjoint shard prefix
+/// (leased writer), writes concurrently, and reads the OTHER process's
+/// published data through a follower on that shard. Per-shard writes are
+/// strongly consistent under the single-writer lease; cross-shard reads
+/// converge once the follower refreshes — no lost, overwritten or mixed keys.
+#[test]
+fn two_writers_share_bucket_with_cross_read_consistency() {
+  let s = MemoryStore::new();
+  let base = "tp/base";
+  let mk = |shard: u64| {
+    Config::for_shard(base, shard)
+      .max_memtable_bytes(1 << 20)
+      .max_segments_before_compact(1_000_000)
+  };
+  let cfg_a = mk(0);
+  let cfg_b = mk(1);
+
+  // Process A and process B both open leased writers on the SAME bucket but
+  // on disjoint prefixes.
+  let a = ObjectLsm::open_leased(
+    Arc::new(s.clone()),
+    cfg_a.clone(),
+    leased_opts("procA", 60_000),
+  )
+  .unwrap();
+  let b = ObjectLsm::open_leased(
+    Arc::new(s.clone()),
+    cfg_b.clone(),
+    leased_opts("procB", 60_000),
+  )
+  .unwrap();
+
+  let pa = a.partition("data").unwrap();
+  let pb = b.partition("data").unwrap();
+  for i in 0..25u32 {
+    pa.insert(format!("a-{i:02}").as_bytes(), format!("va{i}").as_bytes())
+      .unwrap();
+    pb.insert(format!("b-{i:02}").as_bytes(), format!("vb{i}").as_bytes())
+      .unwrap();
+  }
+  a.compact().unwrap();
+  b.compact().unwrap();
+
+  // Each process reads the other's published data through a follower.
+  let fb = ObjectLsm::open_follower(Arc::new(s.clone()), cfg_b.clone(), None).unwrap();
+  fb.refresh().unwrap();
+  let pfb = fb.partition("data").unwrap();
+  assert_eq!(pfb.len().unwrap(), 25, "A sees B's 25 keys");
+  for i in (0..25u32).step_by(5) {
+    assert_eq!(
+      pfb.get(format!("b-{i:02}").as_bytes()).unwrap().unwrap(),
+      format!("vb{i}").into_bytes()
+    );
+  }
+
+  let fa = ObjectLsm::open_follower(Arc::new(s.clone()), cfg_a.clone(), None).unwrap();
+  fa.refresh().unwrap();
+  let pfa = fa.partition("data").unwrap();
+  assert_eq!(pfa.len().unwrap(), 25, "B sees A's 25 keys");
+  assert_eq!(pfa.get(b"a-00").unwrap().unwrap(), b"va0");
+
+  // A keeps writing while B's follower keeps reading: the reader converges.
+  for i in 25..30u32 {
+    pa.insert(format!("a-{i:02}").as_bytes(), format!("va{i}").as_bytes())
+      .unwrap();
+  }
+  a.compact().unwrap();
+  fa.refresh().unwrap();
+  assert_eq!(
+    pfa.len().unwrap(),
+    30,
+    "B's follower converges on A's new keys"
+  );
+
+  // No cross-shard leakage and nothing lost after reopen of each shard.
+  assert_eq!(
+    pfb.get(b"a-00").unwrap(),
+    None,
+    "shards must not leak into each other"
+  );
+  drop(pa);
+  drop(pb);
+  drop(a);
+  drop(b);
+  drop(fa);
+  drop(fb);
+
+  let ra = ObjectLsm::open(Arc::new(s.clone()), cfg_a).unwrap();
+  let p_ra = ra.partition("data").unwrap();
+  assert_eq!(p_ra.len().unwrap(), 30, "A's shard intact after reopen");
+  let rb = ObjectLsm::open(Arc::new(s.clone()), cfg_b).unwrap();
+  let p_rb = rb.partition("data").unwrap();
+  assert_eq!(p_rb.len().unwrap(), 25, "B's shard intact after reopen");
+}
