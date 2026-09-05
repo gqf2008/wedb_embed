@@ -330,6 +330,18 @@ fn min_live_watermark(st: &EngineState) -> u64 {
     .unwrap_or(0)
 }
 
+/// Journal objects decoded per replay wave; bounds peak memory during recovery
+/// and follower refresh.
+const REPLAY_WAVE_OBJECTS: usize = 512;
+
+/// Number of parallel decode workers for journal replay (bounded so a single
+/// open/refresh cannot oversubscribe object-store connections).
+fn replay_workers() -> usize {
+  std::thread::available_parallelism()
+    .map(|n| n.get())
+    .unwrap_or(4)
+    .clamp(1, 8)
+}
 /// One worker's decoded journal chunk during parallel recovery replay:
 /// `(seq, object bytes len, decoded groups)` per replayed object, `None` when
 /// the object disappeared between listing and read.
@@ -390,7 +402,7 @@ fn decode_journal_wave(
       out.extend(
         handle
           .join()
-          .map_err(|_| Error::store("recovery decode worker panicked"))??,
+          .map_err(|_| Error::store("journal decode worker panicked"))??,
       );
     }
     Ok(out)
@@ -470,14 +482,11 @@ fn load_readonly_snapshot(
   // Followers get the same parallel fetch+decode as writer recovery: the
   // per-object object-store GET latency dominates a refresh when the journal
   // tail is long. Apply stays seq-ordered; the epoch filter mirrors recover().
-  let workers = std::thread::available_parallelism()
-    .map(|n| n.get())
-    .unwrap_or(4)
-    .clamp(1, 8);
-  const WAVE_OBJECTS: usize = 512;
+  let workers = replay_workers();
+
   let mut start = 0usize;
   while start < to_read.len() {
-    let end = (start + WAVE_OBJECTS).min(to_read.len());
+    let end = (start + REPLAY_WAVE_OBJECTS).min(to_read.len());
     let wave = decode_journal_wave(store, &to_read[start..end], workers)?;
     for item in wave {
       let Some((seq, len, groups)) = item else {
@@ -692,14 +701,11 @@ fn recover(
   // would; one wave's decoded objects are applied before the next wave is
   // fetched, keeping peak memory proportional to a wave instead of the whole
   // journal tail.
-  let workers = std::thread::available_parallelism()
-    .map(|n| n.get())
-    .unwrap_or(4)
-    .clamp(1, 8);
-  const WAVE_OBJECTS: usize = 512;
+  let workers = replay_workers();
+
   let mut start = 0usize;
   while start < to_read.len() {
-    let end = (start + WAVE_OBJECTS).min(to_read.len());
+    let end = (start + REPLAY_WAVE_OBJECTS).min(to_read.len());
     let wave = decode_journal_wave(store, &to_read[start..end], workers)?;
     for item in wave {
       let Some((seq, len, groups)) = item else {
