@@ -4,7 +4,8 @@
 //! ```text
 //! <prefix>/manifest/current          pointer object -> latest manifest seq
 //! <prefix>/manifest/<seq:020>        immutable manifest snapshots
-//! <prefix>/journal/<seq:020>         immutable committed record groups
+//! <prefix>/journal/<seq:020>         immutable committed record groups (unfenced)
+//! <prefix>/journal/<epoch>/<seq:020>  same, fenced/leased writers (per epoch)
 //! <prefix>/seg/<partition>/<id:020>  immutable sorted segment objects
 //! ```
 //! Zero-padded numeric suffixes keep `list` lexicographic = numeric order.

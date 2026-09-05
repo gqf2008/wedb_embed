@@ -150,6 +150,30 @@ impl ObjectLsm {
     }
     *engine.inner.lease_lost.lock() = Some(lease.lost_flag());
     engine.lease = Some(Arc::new(lease));
+
+    // Establish a durable anchor under THIS instance's epoch before any user
+    // write is acknowledged: fold whatever recovery replayed into segments,
+    // then publish a manifest so `current` always points at an epoch that can
+    // see this writer's own journals. Without it, a writer that crashes after
+    // acking (but before its first natural flush/compact) would leave `current`
+    // anchored to the previous epoch, and the successor would fence off this
+    // epoch's acked journals. If this maintenance fails the lease is released
+    // again (engine drop) and the caller may retry.
+    let parts: Vec<String> = engine
+      .inner
+      .state
+      .read()
+      .partitions
+      .keys()
+      .cloned()
+      .collect();
+    for name in &parts {
+      engine.inner.flush_partition_detached(name)?;
+    }
+    {
+      let mut st = engine.inner.state.write();
+      publish_manifest(&*engine.inner.store, &mut st)?;
+    }
     Ok(Some(engine))
   }
 

@@ -178,6 +178,11 @@ if let Some(engine) = ObjectLsm::try_open_leased(store.clone(), cfg.clone(), opt
   recovery and bumps the fencing epoch; the same-prefix lease + manifest-CAS +
   epoch rules guarantee exactly one writer (`concurrent_standbys_promote_
   exactly_one_writer`).
+
+- Every takeover also folds whatever recovery replayed into segments and
+publishes a manifest under the new epoch, so current is never left anchored
+to an epoch that cannot see this writer's own journals (	akeover_anchor_
+preserves_successor_acks_across_handoff).
 - **Pre-manifest recovery**: when a leader crashes after acknowledged writes
   but before its *first* manifest publish, the successor replays every journal
   object under `<prefix>/journal/` across epochs (sorted by seq), so acked

@@ -404,3 +404,66 @@ fn concurrent_standbys_promote_exactly_one_writer() {
     "winner must recover the crashed leader"
   );
 }
+
+/// Regression for the reviewer finding: a takeover whose replay exceeds the
+/// memtable budget used to auto-flush a manifest before the new fencing epoch
+/// was installed, anchoring `current` to the WRONG epoch. The successor then
+/// fenced off this writer's own acked journals on the next handoff. Takeover
+/// must publish a durable anchor under its own epoch, so a writer that acks
+/// further writes and then hands off without flushing never loses them.
+#[test]
+fn takeover_anchor_preserves_successor_acks_across_handoff() {
+  let s = MemoryStore::new();
+  // Tiny budget so the successor's replay exceeds it and recovery would try to
+  // auto-flush (the path that used to publish a stale-epoch manifest).
+  let cfg = Config::new("ha/t8")
+    .max_memtable_bytes(2048)
+    .max_segments_before_compact(1_000_000);
+  let l1 = ObjectLsm::try_open_leased(Arc::new(s.clone()), cfg.clone(), opts("w0", false, 250))
+    .unwrap()
+    .expect("first writer");
+  let p1 = l1.partition("data").unwrap();
+  for i in 0..50u32 {
+    let key = format!("k{i:03}");
+    let value = vec![b'x'; 96];
+    p1.insert(key.as_bytes(), &value).unwrap();
+  }
+  std::mem::forget(l1);
+  std::mem::forget(p1);
+  thread::sleep(Duration::from_millis(500)); // lease expired
+
+  let t0 = Instant::now();
+  let l2 = loop {
+    if let Some(e) =
+      ObjectLsm::try_open_leased(Arc::new(s.clone()), cfg.clone(), opts("w1", false, 60_000))
+        .unwrap()
+    {
+      break e;
+    }
+    assert!(t0.elapsed() < Duration::from_secs(5), "l2 never promoted");
+    thread::sleep(Duration::from_millis(30));
+  };
+  let p2 = l2.partition("data").unwrap();
+  assert_eq!(p2.len().unwrap(), 50, "l2 must recover the crashed l1");
+
+  // l2 acks three more writes under its OWN epoch, then hands off cleanly
+  // WITHOUT flushing them to a manifest.
+  for i in 50..53u32 {
+    let key = format!("k{i:03}");
+    let value = vec![b'y'; 96];
+    p2.insert(key.as_bytes(), &value).unwrap();
+  }
+  drop(p2);
+  drop(l2);
+
+  let l3 = ObjectLsm::try_open_leased(Arc::new(s.clone()), cfg, opts("w2", false, 60_000))
+    .unwrap()
+    .expect("third writer promotes");
+  let p3 = l3.partition("data").unwrap();
+  assert_eq!(
+    p3.len().unwrap(),
+    53,
+    "l2's acked journals must survive the handoff (anchor under l2's epoch)"
+  );
+  assert_eq!(p3.get(b"k052").unwrap().unwrap(), vec![b'y'; 96]);
+}
