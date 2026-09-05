@@ -3,11 +3,18 @@
 //! Wraps `object_store::aws::AmazonS3` and bridges its async API into the
 //! synchronous [`Store`] trait with an internal multi-thread tokio runtime.
 
-use std::{ops::Range, sync::Arc};
+use std::{
+  ops::Range,
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
+  time::Duration,
+};
 
 use md5::{Digest, Md5};
 use object_store::{
-  ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion,
+  BackoffConfig, ObjectStore, PutMode, PutOptions, PutPayload, RetryConfig, UpdateVersion,
   aws::{AmazonS3Builder, S3ConditionalPut},
   path::Path as ObjPath,
 };
@@ -60,10 +67,24 @@ impl R2Config {
 pub struct R2Store {
   inner: Arc<dyn ObjectStore>,
   rt: Runtime,
+  put_failures: AtomicU64,
+  get_failures: AtomicU64,
+  other_failures: AtomicU64,
 }
 
 impl R2Store {
   pub fn new(cfg: R2Config) -> Result<Self> {
+    let max_retries = env_usize("OBJLSM_R2_MAX_RETRIES", 30);
+    let retry_timeout = Duration::from_secs(env_u64("OBJLSM_R2_RETRY_TIMEOUT_SECS", 300));
+    let retry = RetryConfig {
+      backoff: BackoffConfig {
+        init_backoff: Duration::from_millis(200),
+        max_backoff: Duration::from_secs(10),
+        base: 2.0,
+      },
+      max_retries,
+      retry_timeout,
+    };
     let builder = AmazonS3Builder::new()
       .with_bucket_name(&cfg.bucket)
       .with_region("auto")
@@ -73,12 +94,16 @@ impl R2Store {
       .with_virtual_hosted_style_request(false)
       // Enable If-None-Match / If-Match conditional writes (required by the
       // writer lease's create-if-absent and compare-and-swap on R2).
-      .with_conditional_put(S3ConditionalPut::ETagMatch);
+      .with_conditional_put(S3ConditionalPut::ETagMatch)
+      .with_retry(retry);
     let inner = builder.build().map_err(Error::store)?;
     let rt = Runtime::new().map_err(|e| Error::store(format!("tokio runtime: {e}")))?;
     Ok(Self {
       inner: Arc::new(inner),
       rt,
+      put_failures: AtomicU64::new(0),
+      get_failures: AtomicU64::new(0),
+      other_failures: AtomicU64::new(0),
     })
   }
 
@@ -94,6 +119,35 @@ impl R2Store {
   fn obj_err(e: object_store::Error) -> Error {
     Error::store(e.to_string())
   }
+
+  /// Number of object PUTs that ultimately failed (after retries).
+  pub fn put_failures(&self) -> u64 {
+    self.put_failures.load(Ordering::Relaxed)
+  }
+
+  /// Number of object GETs that ultimately failed (after retries).
+  pub fn get_failures(&self) -> u64 {
+    self.get_failures.load(Ordering::Relaxed)
+  }
+
+  /// Number of other object-store calls (delete/list/…) that failed.
+  pub fn other_failures(&self) -> u64 {
+    self.other_failures.load(Ordering::Relaxed)
+  }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+  std::env::var(name)
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+  std::env::var(name)
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(default)
 }
 
 fn path(key: &str) -> Result<ObjPath> {
@@ -104,7 +158,7 @@ impl Store for R2Store {
   fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
     let p = path(key)?;
     let inner = self.inner.clone();
-    self.block(async move {
+    let res = self.block(async move {
       let r = match inner.get(&p).await {
         Ok(r) => r,
         Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -112,7 +166,11 @@ impl Store for R2Store {
       };
       let b = r.bytes().await.map_err(Self::obj_err)?;
       Ok(Some(b.to_vec()))
-    })
+    });
+    if res.is_err() {
+      self.get_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    res
   }
 
   fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
@@ -123,26 +181,34 @@ impl Store for R2Store {
       .map_err(|_| Error::store("range end exceeds platform usize"))?;
     let range = Range { start, end };
     let inner = self.inner.clone();
-    self.block(async move {
+    let res = self.block(async move {
       match inner.get_range(&p, range).await {
         Ok(b) => Ok(Some(b.to_vec())),
         Err(object_store::Error::NotFound { .. }) => Ok(None),
         Err(e) => Err(Self::obj_err(e)),
       }
-    })
+    });
+    if res.is_err() {
+      self.get_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    res
   }
 
   fn put(&self, key: &str, data: &[u8]) -> Result<()> {
     let p = path(key)?;
     let inner = self.inner.clone();
     let payload = PutPayload::from(data.to_vec());
-    self.block(async move {
+    let res = self.block(async move {
       inner
         .put(&p, payload)
         .await
         .map(|_| ())
         .map_err(Self::obj_err)
-    })
+    });
+    if res.is_err() {
+      self.put_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    res
   }
 
   fn put_if_matches(&self, key: &str, expected: &[u8], new: &[u8]) -> Result<bool> {
@@ -156,7 +222,7 @@ impl Store for R2Store {
     let p = path(key)?;
     let inner = self.inner.clone();
     let payload = PutPayload::from(new.to_vec());
-    self.block(async move {
+    let res = self.block(async move {
       match inner
         .put_opts(
           &p,
@@ -172,14 +238,18 @@ impl Store for R2Store {
         Err(object_store::Error::Precondition { .. }) => Ok(false),
         Err(e) => Err(Self::obj_err(e)),
       }
-    })
+    });
+    if res.is_err() {
+      self.put_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    res
   }
 
   fn create(&self, key: &str, data: &[u8]) -> Result<bool> {
     let p = path(key)?;
     let inner = self.inner.clone();
     let payload = PutPayload::from(data.to_vec());
-    self.block(async move {
+    let res = self.block(async move {
       match inner
         .put_opts(
           &p,
@@ -195,25 +265,33 @@ impl Store for R2Store {
         Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
         Err(e) => Err(Self::obj_err(e)),
       }
-    })
+    });
+    if res.is_err() {
+      self.put_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    res
   }
 
   fn delete(&self, key: &str) -> Result<()> {
     let p = path(key)?;
     let inner = self.inner.clone();
-    self.block(async move {
+    let res = self.block(async move {
       match inner.delete(&p).await {
         Ok(()) => Ok(()),
         Err(object_store::Error::NotFound { .. }) => Ok(()),
         Err(e) => Err(Self::obj_err(e)),
       }
-    })
+    });
+    if res.is_err() {
+      self.other_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    res
   }
 
   fn list(&self, prefix: &str) -> Result<Vec<String>> {
     let p = ObjPath::from(prefix);
     let inner = self.inner.clone();
-    self.block(async move {
+    let res = self.block(async move {
       let mut out = Vec::new();
       let mut stream = inner.list(Some(&p));
       use futures_util::StreamExt;
@@ -222,6 +300,10 @@ impl Store for R2Store {
         out.push(meta.location.to_string());
       }
       Ok(out)
-    })
+    });
+    if res.is_err() {
+      self.other_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    res
   }
 }

@@ -50,6 +50,12 @@ fn main() {
   struct Cleanup(Arc<R2Store>, String);
   impl Drop for Cleanup {
     fn drop(&mut self) {
+      println!(
+        "r2 metrics put_failures={} get_failures={} other_failures={}",
+        self.0.put_failures(),
+        self.0.get_failures(),
+        self.0.other_failures()
+      );
       if let Ok(keys) = self.0.list(&self.1) {
         for key in keys {
           let _ = self.0.delete(&key);
