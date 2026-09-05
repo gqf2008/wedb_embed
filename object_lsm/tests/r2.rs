@@ -541,16 +541,10 @@ fn r2_two_writers_one_bucket_cross_reads() -> wedb_object_lsm::Result<()> {
   };
   let cfg_a = mk(0);
   let cfg_b = mk(1);
-  let opts = |owner: &str| LeaseOptions {
-    owner: owner.into(),
-    ttl: std::time::Duration::from_secs(300),
-    timeout: std::time::Duration::from_millis(1_000),
-    heartbeat: false,
-  };
 
   let store = Arc::new(R2Store::from_env()?);
-  let a = ObjectLsm::open_leased(store.clone(), cfg_a.clone(), opts("procA"))?;
-  let b = ObjectLsm::open_leased(store.clone(), cfg_b.clone(), opts("procB"))?;
+  let a = ObjectLsm::open_leased(store.clone(), cfg_a.clone(), lease_opts("procA"))?;
+  let b = ObjectLsm::open_leased(store.clone(), cfg_b.clone(), lease_opts("procB"))?;
   let pa = a.partition("data")?;
   let pb = b.partition("data")?;
   let n = 5u32;
@@ -590,10 +584,10 @@ fn r2_two_writers_one_bucket_cross_reads() -> wedb_object_lsm::Result<()> {
   drop(follower_b);
 
   // Reopen each shard and verify nothing was lost or mixed.
-  let ra = ObjectLsm::open(Arc::new(R2Store::from_env()?), cfg_a)?;
+  let ra = ObjectLsm::open_leased(Arc::new(R2Store::from_env()?), cfg_a, lease_opts("reopenA"))?;
   let p_ra = ra.partition("data")?;
   assert_eq!(p_ra.len()?, (n + 3) as usize);
-  let rb = ObjectLsm::open(Arc::new(R2Store::from_env()?), cfg_b)?;
+  let rb = ObjectLsm::open_leased(Arc::new(R2Store::from_env()?), cfg_b, lease_opts("reopenB"))?;
   let p_rb = rb.partition("data")?;
   assert_eq!(p_rb.len()?, n as usize);
   assert_eq!(p_rb.get(b"b-00")?.unwrap(), b"vb0");

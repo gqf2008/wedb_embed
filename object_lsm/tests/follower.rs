@@ -526,10 +526,20 @@ fn two_writers_share_bucket_with_cross_read_consistency() {
   drop(fa);
   drop(fb);
 
-  let ra = ObjectLsm::open(Arc::new(s.clone()), cfg_a).unwrap();
+  let ra = ObjectLsm::open_leased(
+    Arc::new(s.clone()),
+    cfg_a.clone(),
+    leased_opts("reopenA", 60_000),
+  )
+  .unwrap();
   let p_ra = ra.partition("data").unwrap();
   assert_eq!(p_ra.len().unwrap(), 30, "A's shard intact after reopen");
-  let rb = ObjectLsm::open(Arc::new(s.clone()), cfg_b).unwrap();
+  let rb = ObjectLsm::open_leased(
+    Arc::new(s.clone()),
+    cfg_b.clone(),
+    leased_opts("reopenB", 60_000),
+  )
+  .unwrap();
   let p_rb = rb.partition("data").unwrap();
   assert_eq!(p_rb.len().unwrap(), 25, "B's shard intact after reopen");
 }

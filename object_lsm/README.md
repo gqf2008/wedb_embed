@@ -275,6 +275,7 @@ let writer_a = ObjectLsm::open_leased(store.clone(), Config::for_shard("myapp/db
 let reader_of_b = ObjectLsm::open_follower(store.clone(), Config::for_shard("myapp/db", 1), poll)?;
 // process B: owns shard-1, reads shard-0 via a follower
 let writer_b = ObjectLsm::open_leased(store.clone(), Config::for_shard("myapp/db", 1), lease("B"))?;
+let reader_of_a = ObjectLsm::open_follower(store.clone(), Config::for_shard("myapp/db", 0), poll)?;
 ```
 
 Consistency model: per-shard writes are strongly consistent under the
@@ -286,7 +287,10 @@ the two processes. Verified offline
 (`two_writers_share_bucket_with_cross_read_consistency`) and live on real
 Cloudflare R2 (`r2_two_writers_one_bucket_cross_reads`).
 
-For "two processes writing the SAME prefix simultaneously": that is rejected by
-design — the lease + fencing guarantee exactly one writer per prefix, which is
-what makes the single-prefix data strongly consistent (use shards or a
-failover/supervisor if you need a second writer on one prefix).
+For "two processes writing the SAME prefix simultaneously": a second *leased*
+writer is rejected by design — the lease + fencing guarantee exactly one writer
+per prefix, which is what makes the single-prefix data strongly consistent (use
+shards or a failover/supervisor if you need a second writer on one prefix). Plain
+ObjectLsm::open` is a single-instance exclusive access path that takes no lease
+and participates in no fencing: never mix it with a leased writer on the same
+prefix.
