@@ -251,7 +251,8 @@ impl ObjectLsm {
   ///
   /// A no-op on a writer; on a follower it performs one read-only snapshot
   /// refresh. Useful to make tests deterministic instead of sleeping on the
-  /// background interval.
+  /// background interval. Serialized with any in-flight background refresh:
+  /// a manual call waits for the poller's current store read to finish.
   pub fn refresh(&self) -> Result<()> {
     refresh_follower(&self.inner)
   }
@@ -312,6 +313,22 @@ fn sync_partition_meta(st: &mut EngineState, ps: &PartitionState) {
   }
 }
 
+/// Min watermark across LIVE (non-dropped) partitions.
+///
+/// A dropped partition must not drag the GC waterline down: rm_partition marks
+/// it dropped and (for a partition removed before any commit) leaves its
+/// watermark at 0 forever, which would otherwise pin `published_min_wm` at 0
+/// and permanently disable journal GC. Groups at/below a live partition's
+/// watermark never touch an already-removed partition (removal discarded its
+/// history), so excluding dropped partitions is safe.
+fn min_live_watermark(st: &EngineState) -> u64 {
+  st.partitions
+    .values()
+    .filter(|pm| !pm.dropped)
+    .map(|pm| pm.watermark)
+    .min()
+    .unwrap_or(0)
+}
 /// Read-only snapshot of a leader prefix: parse `current` -> manifest and
 /// replay that epoch's journal tail above partition watermarks into
 /// `partitions`. Never uploads, compacts, publishes or GCs. A prefix with no
@@ -365,12 +382,7 @@ fn load_readonly_snapshot(
     lock.write().meta = pm.clone();
     st.partitions.insert(name, pm);
   }
-  st.published_min_wm = st
-    .partitions
-    .values()
-    .map(|pm| pm.watermark)
-    .min()
-    .unwrap_or(0);
+  st.published_min_wm = min_live_watermark(&st);
 
   // Replay the durable journal tail of this epoch above the watermarks.
   let list = store.list(&journal_prefix_epoch(prefix, st.fence_epoch))?;
@@ -538,12 +550,7 @@ fn recover(
       lock.write().meta = pm.clone();
       st.partitions.insert(name, pm);
     }
-    st.published_min_wm = st
-      .partitions
-      .values()
-      .map(|pm| pm.watermark)
-      .min()
-      .unwrap_or(0);
+    st.published_min_wm = min_live_watermark(&st);
   }
 
   // Replay every journal group newer than its partition watermark.
@@ -701,12 +708,7 @@ fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
   st.current_bytes = Some(new_current);
   // The mirror watermarks are now durable (this manifest references them), so
   // journals folded by them may be garbage-collected from here on.
-  st.published_min_wm = st
-    .partitions
-    .values()
-    .map(|pm| pm.watermark)
-    .min()
-    .unwrap_or(0);
+  st.published_min_wm = min_live_watermark(st);
   Ok(())
 }
 
@@ -1061,6 +1063,7 @@ fn gc_foreign_journals(store: &dyn Store, st: &mut EngineState) -> Result<()> {
   }
   Ok(())
 }
+
 /// Startup GC: when eager deletion is enabled, delete segment objects not
 /// referenced by the current manifest; always delete manifest snapshots
 /// superseded by `current` (they are cheap metadata, not the high-volume

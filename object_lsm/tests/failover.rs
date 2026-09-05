@@ -582,3 +582,89 @@ fn takeover_gc_superseded_epoch_journals() {
   );
   assert_eq!(p2.get(b"k04").unwrap().unwrap(), b"v4");
 }
+
+/// A dropped partition whose watermark stayed 0 (removed before any commit)
+/// must not pin published_min_wm at 0 and disable journal GC for live
+/// partitions forever.
+#[test]
+fn dropped_partition_does_not_pin_journal_gc() {
+  let s = MemoryStore::new();
+  let cfg = Config::new("ha/t12")
+    .max_memtable_bytes(1 << 20)
+    .max_segments_before_compact(1_000_000);
+  let db = ObjectLsm::open(Arc::new(s.clone()), cfg.clone()).unwrap();
+  // Create and remove an empty partition BEFORE any commit: rm publishes a
+  // manifest marking it dropped with watermark = journal_seq = 0.
+  let trash = db.partition("trash").unwrap();
+  db.rm_partition(&trash).unwrap();
+
+  // A live partition then commits and folds everything.
+  let p = db.partition("data").unwrap();
+  for i in 0..5u32 {
+    p.insert(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes())
+      .unwrap();
+  }
+  db.compact().unwrap();
+
+  let root = wedb_object_lsm::keys::journal_prefix("ha/t12");
+  assert!(
+    s.list(&root).unwrap().is_empty(),
+    "folded journals must be GC'd even with a dropped wm=0 partition present"
+  );
+
+  let db2 = ObjectLsm::open(Arc::new(s.clone()), cfg).unwrap();
+  let p2 = db2.partition("data").unwrap();
+  assert_eq!(p2.len().unwrap(), 5);
+  assert_eq!(p2.get(b"k04").unwrap().unwrap(), b"v4");
+  assert!(!db2.partition_exists("trash"));
+}
+
+/// The recover()-tail cleanup (every writer open) also removes folded journals
+/// of superseded epochs, not just the takeover path.
+#[test]
+fn open_gc_superseded_epoch_journals_at_recover() {
+  let s = MemoryStore::new();
+  let cfg = Config::new("ha/t13")
+    .max_memtable_bytes(1 << 20)
+    .max_segments_before_compact(1_000_000);
+  let l1 = ObjectLsm::try_open_leased(Arc::new(s.clone()), cfg.clone(), opts("w0", false, 250))
+    .unwrap()
+    .expect("first writer");
+  let e1_epoch = l1.fence_epoch();
+  let p1 = l1.partition("data").unwrap();
+  for i in 0..5u32 {
+    p1.insert(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes())
+      .unwrap();
+  }
+  std::mem::forget(l1);
+  std::mem::forget(p1);
+  thread::sleep(Duration::from_millis(500));
+
+  // Takeover folds epoch-1 journals into an epoch-2 anchor and cleans them.
+  let t0 = Instant::now();
+  let l2 = loop {
+    if let Some(e) =
+      ObjectLsm::try_open_leased(Arc::new(s.clone()), cfg.clone(), opts("w1", false, 60_000))
+        .unwrap()
+    {
+      break e;
+    }
+    assert!(t0.elapsed() < Duration::from_secs(5), "w1 never promoted");
+    thread::sleep(Duration::from_millis(30));
+  };
+  drop(l2);
+
+  // Re-inject a folded epoch-1 journal object by hand, then a plain (writer)
+  // open must remove it via the recover()-tail gc_foreign_journals pass.
+  let key = wedb_object_lsm::keys::journal_key_epoch("ha/t13", 3, e1_epoch);
+  s.put(&key, b"stale").unwrap();
+
+  let db = ObjectLsm::open(Arc::new(s.clone()), cfg).unwrap();
+  let p = db.partition("data").unwrap();
+  assert_eq!(p.len().unwrap(), 5, "recover still sees the folded data");
+  assert_eq!(
+    s.get(&key).unwrap(),
+    None,
+    "folded superseded-epoch journal removed by the recover()-tail GC"
+  );
+}
