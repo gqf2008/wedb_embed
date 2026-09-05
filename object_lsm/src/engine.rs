@@ -749,8 +749,18 @@ fn finish_flushed_journal(st: &mut EngineState, key: &str, bytes_len: u64) {
 /// Abort a detached upload and restore its buffer for a later flush.
 fn abort_journal_flush(st: &mut EngineState, buffer: Vec<u8>) {
   st.journal_flushing = false;
+  if buffer.is_empty() {
+    return;
+  }
+  // Preserve the detached (failed) groups in front of any groups appended
+  // while the upload was in flight; dropping them would lose acknowledged but
+  // not-yet-durable writes.
   if st.pending.is_empty() {
     st.pending = buffer;
+  } else {
+    let mut restored = buffer;
+    restored.extend_from_slice(&st.pending);
+    st.pending = restored;
   }
 }
 
@@ -761,7 +771,10 @@ fn flush_journal_pending(store: &dyn Store, st: &mut EngineState) -> Result<()> 
     return Ok(());
   };
   let bytes = buffer.len() as u64;
-  store.put(&key, &buffer)?;
+  if let Err(e) = store.put(&key, &buffer) {
+    abort_journal_flush(st, buffer);
+    return Err(e);
+  }
   finish_flushed_journal(st, &key, bytes);
   Ok(())
 }

@@ -48,3 +48,8 @@ name = "bench_remote"
 harness = false
 required-features = ["r2", "wedb"]
 
+[[bench]]
+name = "bench_r2_soak"
+harness = false
+required-features = ["r2"]
+

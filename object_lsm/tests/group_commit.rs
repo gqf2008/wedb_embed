@@ -3,7 +3,7 @@
 use std::{
   sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
   },
   thread,
   time::{Duration, Instant},
@@ -261,4 +261,60 @@ fn background_memtable_flush_does_not_block_commit() {
   // same pending snapshot on the worker thread.
   thread::sleep(Duration::from_millis(500));
   eng.persist().unwrap();
+}
+
+#[test]
+fn failed_background_journal_upload_keeps_acked_writes() {
+  struct FailOnceJournalStore {
+    inner: MemoryStore,
+    fail_once: AtomicBool,
+  }
+  impl Store for FailOnceJournalStore {
+    fn get(&self, key: &str) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+      self.inner.get(key)
+    }
+    fn get_range(
+      &self,
+      key: &str,
+      offset: u64,
+      len: u64,
+    ) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+      self.inner.get_range(key, offset, len)
+    }
+    fn put(&self, key: &str, data: &[u8]) -> wedb_object_lsm::Result<()> {
+      if key.contains("/journal/") && self.fail_once.swap(false, Ordering::SeqCst) {
+        return Err(wedb_object_lsm::Error::store("injected journal failure"));
+      }
+      self.inner.put(key, data)
+    }
+    fn delete(&self, key: &str) -> wedb_object_lsm::Result<()> {
+      self.inner.delete(key)
+    }
+    fn list(&self, prefix: &str) -> wedb_object_lsm::Result<Vec<String>> {
+      self.inner.list(prefix)
+    }
+  }
+
+  let store = Arc::new(FailOnceJournalStore {
+    inner: MemoryStore::new(),
+    fail_once: AtomicBool::new(true),
+  });
+  let cfg = window_cfg("gc/failrecover", 5);
+  let eng = ObjectLsm::open(store.clone(), cfg).unwrap();
+  let p = eng.partition("data").unwrap();
+  let n = 2000u32;
+  for i in 0..n {
+    p.insert(format!("k{i:05}").as_bytes(), b"v").unwrap();
+  }
+  // Let the first background flush fail and a later one retry with the
+  // restored buffer.
+  thread::sleep(Duration::from_millis(300));
+  eng.persist().unwrap();
+  drop(eng);
+  drop(p);
+
+  let eng2 = ObjectLsm::open(store, window_cfg("gc/failrecover", 5)).unwrap();
+  let p2 = eng2.partition("data").unwrap();
+  assert_eq!(p2.len().unwrap(), n as usize);
+  assert_eq!(p2.get(b"k01999").unwrap().unwrap(), b"v");
 }

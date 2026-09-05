@@ -7,7 +7,10 @@
 #![cfg(feature = "r2")]
 
 use std::{
-  sync::{Arc, Barrier},
+  sync::{
+    Arc, Barrier,
+    atomic::{AtomicBool, Ordering},
+  },
   thread,
 };
 
@@ -261,6 +264,92 @@ fn r2_same_prefix_lease_fencing() -> wedb_object_lsm::Result<()> {
   // Cleanup.
   for key in store2.list(&prefix)? {
     let _ = store2.delete(&key);
+  }
+  Ok(())
+}
+
+struct R2Flaky {
+  inner: Arc<R2Store>,
+  fail_seg_put: AtomicBool,
+}
+
+impl Store for R2Flaky {
+  fn get(&self, key: &str) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+    self.inner.get(key)
+  }
+  fn get_range(
+    &self,
+    key: &str,
+    offset: u64,
+    len: u64,
+  ) -> wedb_object_lsm::Result<Option<Vec<u8>>> {
+    self.inner.get_range(key, offset, len)
+  }
+  fn put(&self, key: &str, data: &[u8]) -> wedb_object_lsm::Result<()> {
+    if key.contains("/seg/") && self.fail_seg_put.swap(false, Ordering::SeqCst) {
+      return Err(wedb_object_lsm::Error::store(
+        "injected segment put failure",
+      ));
+    }
+    self.inner.put(key, data)
+  }
+  fn delete(&self, key: &str) -> wedb_object_lsm::Result<()> {
+    self.inner.delete(key)
+  }
+  fn list(&self, prefix: &str) -> wedb_object_lsm::Result<Vec<String>> {
+    self.inner.list(prefix)
+  }
+}
+
+#[test]
+fn r2_transient_segment_put_failure_keeps_old_run() -> wedb_object_lsm::Result<()> {
+  if !env_ok() {
+    eprintln!("R2 env not configured; skipping live test");
+    return Ok(());
+  }
+  let prefix = prefix();
+  let base = Arc::new(R2Store::from_env()?);
+  let flaky = Arc::new(R2Flaky {
+    inner: base.clone(),
+    fail_seg_put: AtomicBool::new(false),
+  });
+  let cfg = Config::new(&prefix)
+    .max_memtable_bytes(1 << 20)
+    .block_size(512)
+    .journal_window_ms(Some(5))
+    .max_segments_before_compact(1_000_000);
+  let eng = ObjectLsm::open(flaky.clone(), cfg.clone())?;
+  let p = eng.partition("data")?;
+  let n = 80u32;
+  for i in 0..n {
+    p.insert(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes())?;
+  }
+
+  // Fail the first segment upload during compact; journal writes are already
+  // durable, so a reopen must recover every key.
+  flaky.fail_seg_put.store(true, Ordering::SeqCst);
+  assert!(
+    eng.compact().is_err(),
+    "injected segment-upload failure must fail compact"
+  );
+  drop(eng);
+  drop(p);
+
+  let eng2 = ObjectLsm::open(Arc::new(R2Store::from_env()?), cfg)?;
+  let p2 = eng2.partition("data")?;
+  assert_eq!(
+    p2.len()?,
+    n as usize,
+    "journal replay must recover all keys"
+  );
+  assert_eq!(p2.get(b"k007")?.unwrap(), b"v7");
+  eng2.compact()?;
+  assert_eq!(p2.table_count(), 1);
+  drop(eng2);
+  drop(p2);
+
+  for key in base.list(&prefix)? {
+    let _ = base.delete(&key);
   }
   Ok(())
 }
