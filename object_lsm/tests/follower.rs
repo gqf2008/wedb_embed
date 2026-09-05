@@ -393,3 +393,48 @@ fn dropping_follower_stops_background_polls() {
     "background polls must stop after the follower drops (after_drop={after_drop}, later={later})"
   );
 }
+
+/// A stale follower snapshot must surface an error (not a silent miss) when the
+/// leader has already compacted away a segment the follower still references,
+/// and must recover once it refreshes to the new manifest.
+#[test]
+fn follower_stale_read_errors_after_leader_deletes_segment() {
+  let s = MemoryStore::new();
+  let cfg = Config::new("fo/t11")
+    .max_memtable_bytes(1 << 20)
+    .block_size(64)
+    .max_segments_before_compact(2);
+  let leader = ObjectLsm::open(Arc::new(s.clone()), cfg.clone()).unwrap();
+  let p = leader.partition("data").unwrap();
+  for i in 0..4u32 {
+    p.insert(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes())
+      .unwrap();
+  }
+  leader.compact().unwrap(); // manifest references segment S1
+
+  // Follower loads S1 but does NOT warm any block (so a later stale read must
+  // hit the store instead of the block cache).
+  let follower = ObjectLsm::open_follower(Arc::new(s.clone()), cfg.clone(), None).unwrap();
+  follower.refresh().unwrap();
+  let pf = follower.partition("data").unwrap();
+  assert_eq!(pf.table_count(), 1, "follower references the first segment");
+
+  // Leader writes more and compacts: S1 is merged away and its object deleted.
+  for i in 4..8u32 {
+    p.insert(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes())
+      .unwrap();
+  }
+  leader.compact().unwrap();
+
+  // The follower still points at S1; reading a not-yet-cached key of it must
+  // error loudly instead of silently returning None or stale data.
+  let res = pf.get(b"k001");
+  assert!(
+    res.is_err(),
+    "stale segment read must surface an error, got {res:?}"
+  );
+
+  follower.refresh().unwrap();
+  assert_eq!(pf.get(b"k001").unwrap().unwrap(), b"v1");
+  assert_eq!(pf.get(b"k007").unwrap().unwrap(), b"v7");
+}

@@ -190,9 +190,11 @@ preserves_successor_acks_across_handoff).
   but before its *first* manifest publish, the successor replays every journal
   object under `<prefix>/journal/` across epochs (sorted by seq), so acked
   writes survive even though no manifest ever existed. Journals of superseded
-  epochs are fenced off once a manifest exists; old-epoch journal objects left
-  behind by repeated failovers can be reclaimed by an object-store lifecycle
-  rule (e.g. expire `*/journal/*` older than N days).
+  epochs are fenced off once a manifest exists, and once a takeover folds them
+  into its anchor manifest they are garbage-collected automatically (at
+  takeover and at every open); only journals above the folded watermark (from a
+  fenced writer's uncertainty window) linger, and those can be reclaimed by an
+  object-store lifecycle rule (e.g. expire `*/journal/*` older than N days).
 - Live R2 test `r2_same_prefix_auto_failover_after_leader_crash`: leader writes
   strict-mode keys (never flushed), crashes; a standby promotes after lease
   expiry and recovers every acked key from real Cloudflare R2.

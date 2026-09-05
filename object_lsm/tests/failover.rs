@@ -533,3 +533,52 @@ fn failed_manifest_publish_keeps_journals_for_recovery() {
     "acked write must survive a failed manifest publish (journal kept)"
   );
 }
+
+/// Superseded-epoch journal objects must be garbage-collected once a takeover
+/// has folded them into its anchor manifest; otherwise they accumulate in the
+/// bucket forever (gc_journal only removes current-epoch keys).
+#[test]
+fn takeover_gc_superseded_epoch_journals() {
+  let s = MemoryStore::new();
+  let cfg = Config::new("ha/t11")
+    .max_memtable_bytes(1 << 20)
+    .max_segments_before_compact(1_000_000);
+  let l1 = ObjectLsm::try_open_leased(Arc::new(s.clone()), cfg.clone(), opts("w0", false, 250))
+    .unwrap()
+    .expect("first writer");
+  let p1 = l1.partition("data").unwrap();
+  for i in 0..5u32 {
+    p1.insert(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes())
+      .unwrap();
+  }
+  // Crash before any manifest: the acked writes live only as epoch-1 journals.
+  std::mem::forget(l1);
+  std::mem::forget(p1);
+  thread::sleep(Duration::from_millis(500));
+
+  let t0 = Instant::now();
+  let l2 = loop {
+    if let Some(e) =
+      ObjectLsm::try_open_leased(Arc::new(s.clone()), cfg.clone(), opts("w1", false, 60_000))
+        .unwrap()
+    {
+      break e;
+    }
+    assert!(t0.elapsed() < Duration::from_secs(5), "w1 never promoted");
+    thread::sleep(Duration::from_millis(30));
+  };
+  let p2 = l2.partition("data").unwrap();
+  assert_eq!(
+    p2.len().unwrap(),
+    5,
+    "successor must recover the crashed leader"
+  );
+
+  let root = wedb_object_lsm::keys::journal_prefix("ha/t11");
+  let left = s.list(&root).unwrap();
+  assert!(
+    left.is_empty(),
+    "superseded-epoch journals must be GC'd after takeover, left: {left:?}"
+  );
+  assert_eq!(p2.get(b"k04").unwrap().unwrap(), b"v4");
+}

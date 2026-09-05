@@ -56,6 +56,9 @@ pub struct Inner {
   /// Read-only replica flag: followers serve reads over a leader's shared
   /// prefix and reject every store-mutating operation.
   pub read_only: AtomicBool,
+  /// Serializes follower snapshot refreshes so a slower loader can never
+  /// overwrite a newer view with an older one.
+  pub refresh_lock: parking_lot::Mutex<()>,
   /// Shared lease-lost flag used for best-effort write fencing; the lease
   /// object itself is owned by the `ObjectLsm` handle (not by `Inner`), so
   /// partition handles cannot prolong its lifetime.
@@ -177,6 +180,13 @@ impl ObjectLsm {
       let mut st = engine.inner.state.write();
       publish_manifest(&*engine.inner.store, &mut st)?;
     }
+    // Folded journals of superseded (predecessor) epochs are only deletable
+    // here - gc_journal removes current-epoch keys only - so clean them once,
+    // right after this epoch's anchor makes them unreachable.
+    {
+      let mut st = engine.inner.state.write();
+      gc_foreign_journals(&*engine.inner.store, &mut st)?;
+    }
     Ok(Some(engine))
   }
 
@@ -227,6 +237,7 @@ impl ObjectLsm {
       journal_stop: Arc::new(AtomicBool::new(false)),
       lease_lost: parking_lot::Mutex::new(None),
       read_only: AtomicBool::new(true),
+      refresh_lock: parking_lot::Mutex::new(()),
     });
     if let Some(interval) = refresh
       && !interval.is_zero()
@@ -263,6 +274,7 @@ impl ObjectLsm {
       journal_stop: journal_stop.clone(),
       lease_lost: parking_lot::Mutex::new(None),
       read_only: AtomicBool::new(false),
+      refresh_lock: parking_lot::Mutex::new(()),
     });
     if cfg.journal_window_ms.is_some() {
       spawn_journal_flusher(inner.clone());
@@ -401,6 +413,10 @@ fn refresh_follower(inner: &Inner) -> Result<()> {
   if !inner.read_only.load(Ordering::SeqCst) {
     return Ok(());
   }
+  // Serialize snapshot loads+swaps (a manual refresh() and the background
+  // poller share this), so a slow loader can never install an OLDER view over
+  // a newer one that has already landed.
+  let _refresh = inner.refresh_lock.lock();
   let cfg = inner.state.read().cfg.clone();
   let scratch = PartitionTable::default();
   let fresh = load_readonly_snapshot(&*inner.store, &cfg, &scratch, &inner.index_cache)?;
@@ -414,6 +430,10 @@ fn refresh_follower(inner: &Inner) -> Result<()> {
     }
   }
 
+  // Swap order: global metadata first, then each partition under its own write
+  // lock. Readers never nest the partition and global locks, so there is no
+  // deadlock; the swap is not atomic ACROSS partitions (fine for an
+  // eventually-consistent follower view; each partition's read is atomic).
   // Global metadata first...
   {
     let mut st = inner.state.write();
@@ -608,6 +628,7 @@ fn recover(
   maybe_compact_all_state(store, &mut st, partitions, readers)?;
   gc_journal(store, &mut st);
   gc_objects_at_open(store, &mut st)?;
+  gc_foreign_journals(store, &mut st)?;
   Ok(st)
 }
 
@@ -1010,6 +1031,36 @@ fn gc_journal(store: &dyn Store, st: &mut EngineState) {
   }
 }
 
+/// Delete journal objects of superseded (foreign) epochs that have already been
+/// folded into the current manifest (`seq <= published_min_wm`).
+///
+/// [`gc_journal`] only ever deletes the CURRENT epoch's keys, so without this
+/// the journals a predecessor writer left behind would accumulate in the
+/// bucket forever. Runs once at open (after recovery) and once right after a
+/// lease takeover publishes its new-epoch anchor. Foreign journals above the
+/// published watermark are kept (a stale, fenced writer may still have written
+/// them; they are invisible either way and can be reclaimed by a lifecycle
+/// rule).
+fn gc_foreign_journals(store: &dyn Store, st: &mut EngineState) -> Result<()> {
+  let root = journal_prefix(&st.cfg.prefix);
+  let wm = st.published_min_wm;
+  if wm == 0 {
+    return Ok(());
+  }
+  let epoch = st.fence_epoch;
+  let keys = store.list(&root)?;
+  for key in keys {
+    let Some((e, s)) = parse_journal_tail(&key, &root) else {
+      continue;
+    };
+    if e != epoch && s <= wm {
+      let _ = store.delete(&key);
+      st.journal_seqs.remove(&s);
+      st.journal_sizes.remove(&s);
+    }
+  }
+  Ok(())
+}
 /// Startup GC: when eager deletion is enabled, delete segment objects not
 /// referenced by the current manifest; always delete manifest snapshots
 /// superseded by `current` (they are cheap metadata, not the high-volume
