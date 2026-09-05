@@ -668,3 +668,144 @@ fn open_gc_superseded_epoch_journals_at_recover() {
     "folded superseded-epoch journal removed by the recover()-tail GC"
   );
 }
+
+/// A failed flip of the `current` pointer (the manifest object was written but
+/// visibility never advanced) must leave journals intact so a reopen recovers
+/// every acked write — never a silent ack of an unflushed state.
+#[test]
+fn fenced_current_flip_failure_preserves_journals() {
+  #[derive(Clone)]
+  struct FailCurrentOnce {
+    inner: MemoryStore,
+    armed: Arc<AtomicBool>,
+  }
+  impl Store for FailCurrentOnce {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+      self.inner.get(key)
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+      self.inner.get_range(key, offset, len)
+    }
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+      if key.ends_with("/manifest/current") && self.armed.swap(false, Ordering::SeqCst) {
+        return Err(wedb_object_lsm::Error::store(
+          "injected current flip failure",
+        ));
+      }
+      self.inner.put(key, data)
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+      self.inner.delete(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+      self.inner.list(prefix)
+    }
+  }
+
+  let armed = Arc::new(AtomicBool::new(true));
+  let store = FailCurrentOnce {
+    inner: MemoryStore::new(),
+    armed: armed.clone(),
+  };
+  let cfg = Config::new("ha/t14")
+    .max_memtable_bytes(1 << 20)
+    .max_segments_before_compact(1_000_000);
+  let db = ObjectLsm::open(Arc::new(store.clone()), cfg.clone()).unwrap();
+  let p = db.partition("data").unwrap();
+  for i in 0..5u32 {
+    p.insert(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes())
+      .unwrap();
+  }
+  assert!(
+    db.compact().is_err(),
+    "injected current-pointer failure must fail the publish"
+  );
+  drop(p);
+  drop(db);
+
+  let db2 = ObjectLsm::open(Arc::new(store), cfg).unwrap();
+  let p2 = db2.partition("data").unwrap();
+  assert_eq!(p2.len().unwrap(), 5, "reopen recovers via journals");
+  assert_eq!(p2.get(b"k04").unwrap().unwrap(), b"v4");
+}
+
+/// Repeated journal-object PUT failures must never acknowledge a write: a
+/// failed commit is invisible and must be retried; after success everything is
+/// durable with no holes or duplicates.
+#[test]
+fn repeated_journal_put_failures_need_success_before_ack() {
+  #[derive(Clone)]
+  struct FailJournalPuts {
+    inner: MemoryStore,
+    n: Arc<std::sync::atomic::AtomicUsize>,
+    fail_at: Vec<usize>,
+  }
+  impl Store for FailJournalPuts {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+      self.inner.get(key)
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+      self.inner.get_range(key, offset, len)
+    }
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+      if key.contains("/journal/") {
+        let i = self.n.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_at.contains(&i) {
+          return Err(wedb_object_lsm::Error::store(
+            "injected journal put failure",
+          ));
+        }
+      }
+      self.inner.put(key, data)
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+      self.inner.delete(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+      self.inner.list(prefix)
+    }
+  }
+
+  let store = FailJournalPuts {
+    inner: MemoryStore::new(),
+    n: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    fail_at: vec![2, 4],
+  };
+  let cfg = Config::new("ha/t15")
+    .max_memtable_bytes(1 << 20)
+    .max_segments_before_compact(1_000_000);
+  let db = ObjectLsm::open(Arc::new(store.clone()), cfg.clone()).unwrap();
+  let p = db.partition("data").unwrap();
+
+  // The store fails two journal-object PUTs (ordinals 2 and 4) wherever they
+  // land. A failed commit returns Err and is invisible; the caller retries
+  // until success. No acknowledged write may ever be lost or duplicated.
+  for i in 1..=5u32 {
+    let key = format!("k{i}");
+    let value = format!("v{i}");
+    loop {
+      match p.insert(key.as_bytes(), value.as_bytes()) {
+        Ok(()) => break,
+        Err(_) => continue,
+      }
+    }
+    assert_eq!(
+      p.get(key.as_bytes()).unwrap().unwrap(),
+      value.into_bytes(),
+      "acked write must be immediately visible"
+    );
+  }
+  assert_eq!(p.len().unwrap(), 5);
+  drop(p);
+  drop(db);
+
+  let db2 = ObjectLsm::open(Arc::new(store), cfg).unwrap();
+  let p2 = db2.partition("data").unwrap();
+  assert_eq!(p2.len().unwrap(), 5, "no holes or duplicates after reopen");
+  for i in 1..=5u32 {
+    assert_eq!(
+      p2.get(format!("k{i}").as_bytes()).unwrap().unwrap(),
+      format!("v{i}").into_bytes()
+    );
+  }
+}

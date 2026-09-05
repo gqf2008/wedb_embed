@@ -329,6 +329,11 @@ fn min_live_watermark(st: &EngineState) -> u64 {
     .min()
     .unwrap_or(0)
 }
+
+/// One worker's decoded journal chunk during parallel recovery replay:
+/// `(seq, object bytes len, decoded groups)` per replayed object, `None` when
+/// the object disappeared between listing and read.
+type DecodedJournalChunk = Vec<Option<(u64, u64, Vec<Group>)>>;
 /// Read-only snapshot of a leader prefix: parse `current` -> manifest and
 /// replay that epoch's journal tail above partition watermarks into
 /// `partitions`. Never uploads, compacts, publishes or GCs. A prefix with no
@@ -600,21 +605,66 @@ fn recover(
     .min()
     .unwrap_or(0);
   pending.sort_by_key(|(_, s)| *s);
-  for (key, s) in pending {
+  let to_read: Vec<(String, u64)> = pending
+    .into_iter()
     // Groups in an object whose end-seq is at/below every partition watermark
     // are already folded into durable segments; skip the whole object.
-    if s <= min_wm {
-      continue;
-    }
-    let Some(bytes) = store.get(&key)? else {
-      continue;
-    };
-    st.journal_sizes.insert(s, bytes.len() as u64);
-    for group in decode_group_stream(&bytes)? {
-      if has_manifest && group.epoch != st.fence_epoch {
-        continue;
+    .filter(|(_, s)| *s > min_wm)
+    .collect();
+  // Fetch and decode journal objects in parallel — on an object store the
+  // per-object GET latency dominates recovery, so serial replay is the slow
+  // path of reopen/failover. The apply below stays strictly seq-ordered, and
+  // any missing object is skipped exactly as a serial replay would.
+  let decoded: Vec<DecodedJournalChunk> = if to_read.is_empty() {
+    Vec::new()
+  } else {
+    let workers = std::thread::available_parallelism()
+      .map(|n| n.get())
+      .unwrap_or(4)
+      .clamp(1, 8);
+    let chunk_size = to_read.len().div_ceil(workers).max(1);
+    let chunks: Vec<&[(String, u64)]> = to_read.chunks(chunk_size).collect();
+    std::thread::scope(|scope| -> Result<Vec<DecodedJournalChunk>> {
+      let mut handles = Vec::with_capacity(chunks.len());
+      for chunk in &chunks {
+        handles.push(scope.spawn(move || {
+          let mut out = Vec::with_capacity(chunk.len());
+          for (key, seq) in *chunk {
+            match store.get(key) {
+              Ok(Some(bytes)) => {
+                let groups: Vec<Group> = decode_group_stream(&bytes)?;
+                out.push(Some((*seq, bytes.len() as u64, groups)));
+              }
+              Ok(None) => out.push(None),
+              Err(e) => return Err(e),
+            }
+          }
+          Ok(out)
+        }));
       }
-      apply_group_recover(&mut st, &group, partitions)?;
+      let mut results = Vec::with_capacity(handles.len());
+      for handle in handles {
+        results.push(
+          handle
+            .join()
+            .map_err(|_| Error::store("recovery decode worker panicked"))??,
+        );
+      }
+      Ok(results)
+    })?
+  };
+  for chunk in decoded {
+    for item in chunk {
+      let Some((seq, len, groups)) = item else {
+        continue;
+      };
+      st.journal_sizes.insert(seq, len);
+      for group in groups {
+        if has_manifest && group.epoch != st.fence_epoch {
+          continue;
+        }
+        apply_group_recover(&mut st, &group, partitions)?;
+      }
     }
   }
 

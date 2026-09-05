@@ -6,7 +6,7 @@ use std::{process::Command, sync::Arc};
 
 use tempfile::tempdir;
 use wedb_embed_engine::{Engine, Partition};
-use wedb_object_lsm::{Config, FileStore, ObjectLsm};
+use wedb_object_lsm::{Config, FileStore, LeaseOptions, ObjectLsm, Store};
 
 fn spawn_child(mode: &str, dir: &str) {
   let status = Command::new(std::env::current_exe().unwrap())
@@ -151,6 +151,67 @@ fn crash_child() {
       db.compact().unwrap();
       std::process::abort();
     }
+    "leased_anchor" => {
+      // Leased writer acks 20 strict-mode writes and dies BEFORE publishing any
+      // manifest: recovery + takeover must replay the acked journals.
+      let cfg = Config::new("crash").max_memtable_bytes(1 << 20);
+      let db = ObjectLsm::open_leased(
+        store,
+        cfg,
+        LeaseOptions {
+          owner: "w0".into(),
+          ttl: std::time::Duration::from_millis(250),
+          timeout: std::time::Duration::from_millis(1_000),
+          heartbeat: false,
+        },
+      )
+      .unwrap();
+      let p = db.partition("data").unwrap();
+      for i in 0..20u32 {
+        p.insert(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes())
+          .unwrap();
+      }
+      std::process::abort();
+    }
     _ => {}
   }
+}
+
+/// A leased writer aborts via SIGABRT after acknowledged strict-mode writes but
+/// BEFORE its first manifest publish. The lease object is left in place; after
+/// it expires a successor takes over and must recover every acked write from
+/// the predecessor's journals (process-level crash, FileStore backend).
+#[test]
+fn leased_crash_before_first_manifest_takeover_recovers() {
+  let d = tempdir().unwrap();
+  spawn_child("leased_anchor", d.path().to_str().unwrap());
+  std::thread::sleep(std::time::Duration::from_millis(600)); // lease expires
+
+  let store = Arc::new(FileStore::new(d.path().to_str().unwrap()).unwrap());
+  let cfg = Config::new("crash").max_memtable_bytes(1 << 20);
+  let opts = |owner: &str| LeaseOptions {
+    owner: owner.into(),
+    ttl: std::time::Duration::from_secs(60),
+    timeout: std::time::Duration::from_millis(2_000),
+    heartbeat: false,
+  };
+  let db = ObjectLsm::open_leased(store.clone(), cfg, opts("w1")).unwrap();
+  let p = db.partition("data").unwrap();
+  assert_eq!(
+    p.len().unwrap(),
+    20,
+    "takeover recovers pre-manifest acked writes"
+  );
+  for i in (0..20u32).step_by(5) {
+    assert_eq!(
+      p.get(format!("k{i:03}").as_bytes()).unwrap().unwrap(),
+      format!("v{i}").into_bytes()
+    );
+  }
+  // The predecessor's journals were folded by the takeover anchor and GC'd.
+  let root = wedb_object_lsm::keys::journal_prefix("crash");
+  assert!(
+    store.list(&root).unwrap().is_empty(),
+    "superseded-epoch journals cleaned after process-level takeover"
+  );
 }

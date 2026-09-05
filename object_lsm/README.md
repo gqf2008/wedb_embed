@@ -125,6 +125,11 @@ single segment, cold reads stay low single-digit ms, and every key is recovered
 after reopen. Reopen time grows sub-linearly with key count here (manifest /
 segment metadata, not a full key replay).
 
+Recovery replay fetches and decodes journal objects in parallel (bounded
+by CPU count, apply stays strictly seq-ordered): an offline 60k-key strict-mode
+reopen dropped from ~3.8 s (serial) to ~1.5 s (~2.5x); on R2 the per-object GET
+latency dominates, so the parallel fetch gives a larger win on failover/reopen.
+
 ## Multi-instance shared bucket: lease + sharding
 
 `ObjectLsm::open_leased(store, cfg, LeaseOptions)` makes an instance the
