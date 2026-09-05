@@ -466,20 +466,32 @@ fn load_readonly_snapshot(
   st.journal_seq = max_seq;
   let min_wm = st.published_min_wm;
   pending.sort_by_key(|(_, s)| *s);
-  for (key, s) in pending {
-    if s <= min_wm {
-      continue;
-    }
-    let Some(bytes) = store.get(&key)? else {
-      continue;
-    };
-    st.journal_sizes.insert(s, bytes.len() as u64);
-    for group in decode_group_stream(&bytes)? {
-      if group.epoch != st.fence_epoch {
+  let to_read: Vec<(String, u64)> = pending.into_iter().filter(|(_, s)| *s > min_wm).collect();
+  // Followers get the same parallel fetch+decode as writer recovery: the
+  // per-object object-store GET latency dominates a refresh when the journal
+  // tail is long. Apply stays seq-ordered; the epoch filter mirrors recover().
+  let workers = std::thread::available_parallelism()
+    .map(|n| n.get())
+    .unwrap_or(4)
+    .clamp(1, 8);
+  const WAVE_OBJECTS: usize = 512;
+  let mut start = 0usize;
+  while start < to_read.len() {
+    let end = (start + WAVE_OBJECTS).min(to_read.len());
+    let wave = decode_journal_wave(store, &to_read[start..end], workers)?;
+    for item in wave {
+      let Some((seq, len, groups)) = item else {
         continue;
+      };
+      st.journal_sizes.insert(seq, len);
+      for group in groups {
+        if group.epoch != st.fence_epoch {
+          continue;
+        }
+        apply_group_recover(&mut st, &group, partitions)?;
       }
-      apply_group_recover(&mut st, &group, partitions)?;
     }
+    start = end;
   }
   Ok(st)
 }
