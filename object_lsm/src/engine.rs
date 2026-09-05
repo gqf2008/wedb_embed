@@ -53,6 +53,9 @@ pub struct Inner {
   pub index_cache: IndexCache,
   /// Stops the background group-commit journal flusher thread.
   pub journal_stop: Arc<AtomicBool>,
+  /// Read-only replica flag: followers serve reads over a leader's shared
+  /// prefix and reject every store-mutating operation.
+  pub read_only: AtomicBool,
   /// Shared lease-lost flag used for best-effort write fencing; the lease
   /// object itself is owned by the `ObjectLsm` handle (not by `Inner`), so
   /// partition handles cannot prolong its lifetime.
@@ -185,6 +188,63 @@ impl ObjectLsm {
     self.inner.state.read().fence_epoch
   }
 
+  /// Open a read-only follower of `cfg.prefix` in `store`.
+  ///
+  /// A follower does NOT acquire the writer lease and never writes to the
+  /// store. It periodically re-reads the leader's manifest (`current`) and the
+  /// durable journal tail of that manifest's epoch, refreshing its in-memory
+  /// view so reads track the leader's *published* state. `refresh` selects the
+  /// background poll interval (`None` disables the thread; call [`Self::refresh`]
+  /// manually, e.g. in tests). Every store-mutating call on the returned
+  /// engine fails with a read-only error.
+  ///
+  /// Visibility: the follower sees what the leader made durable and published —
+  /// segments folded by a manifest publish plus strict-mode / flushed
+  /// group-commit journal objects above the manifest watermark. A group-commit
+  /// ack still buffered in the leader is not visible.
+  pub fn open_follower(
+    store: Arc<dyn Store>,
+    cfg: Config,
+    refresh: Option<Duration>,
+  ) -> Result<Self> {
+    // Followers never buffer journals or run writer maintenance: force the
+    // writer-side options off so no flusher thread is spawned and drop is
+    // inert.
+    let fcfg = cfg.journal_window_ms(None).background_flush(false);
+    let block_cache = BlockCache::new(fcfg.cache_capacity);
+    let index_cache = IndexCache::default();
+    let partitions = PartitionTable::default();
+    let readers = ReaderGate::default();
+    let state = load_readonly_snapshot(&*store, &fcfg, &partitions, &index_cache)?;
+    let inner = Arc::new(Inner {
+      store,
+      state: RwLock::new(state),
+      journal_lock: Mutex::new(()),
+      readers,
+      partitions,
+      block_cache,
+      index_cache,
+      journal_stop: Arc::new(AtomicBool::new(false)),
+      lease_lost: parking_lot::Mutex::new(None),
+      read_only: AtomicBool::new(true),
+    });
+    if let Some(interval) = refresh
+      && !interval.is_zero()
+    {
+      spawn_follower_refresh(inner.clone(), interval);
+    }
+    Ok(Self { inner, lease: None })
+  }
+
+  /// Re-read the leader's published state into this engine's view.
+  ///
+  /// A no-op on a writer; on a follower it performs one read-only snapshot
+  /// refresh. Useful to make tests deterministic instead of sleeping on the
+  /// background interval.
+  pub fn refresh(&self) -> Result<()> {
+    refresh_follower(&self.inner)
+  }
+
   fn build(store: Arc<dyn Store>, cfg: Config) -> Result<Self> {
     let block_cache = BlockCache::new(cfg.cache_capacity);
     let index_cache = IndexCache::default();
@@ -202,6 +262,7 @@ impl ObjectLsm {
       index_cache,
       journal_stop: journal_stop.clone(),
       lease_lost: parking_lot::Mutex::new(None),
+      read_only: AtomicBool::new(false),
     });
     if cfg.journal_window_ms.is_some() {
       spawn_journal_flusher(inner.clone());
@@ -237,6 +298,174 @@ fn sync_partition_meta(st: &mut EngineState, ps: &PartitionState) {
   if let Some(pm) = st.partitions.get_mut(&ps.name) {
     *pm = ps.meta.clone();
   }
+}
+
+/// Read-only snapshot of a leader prefix: parse `current` -> manifest and
+/// replay that epoch's journal tail above partition watermarks into
+/// `partitions`. Never uploads, compacts, publishes or GCs. A prefix with no
+/// manifest yet yields an empty snapshot (a follower only tracks published
+/// state).
+fn load_readonly_snapshot(
+  store: &dyn Store,
+  cfg: &Config,
+  partitions: &PartitionTable,
+  index_cache: &IndexCache,
+) -> Result<EngineState> {
+  let mut st = EngineState::new(cfg.clone());
+  let prefix = &cfg.prefix;
+  let Some(cur) = store.get(&current_key(prefix))? else {
+    return Ok(st);
+  };
+  let text =
+    std::str::from_utf8(&cur).map_err(|e| Error::Corrupt(format!("current not utf-8: {e}")))?;
+  let (seq_text, epoch) = match text.split_once('\n') {
+    Some((seq, epoch)) => (
+      seq,
+      Some(
+        epoch
+          .trim()
+          .parse::<u128>()
+          .map_err(|e| Error::Corrupt(format!("current epoch: {e}")))?,
+      ),
+    ),
+    None => (text, None),
+  };
+  let mseq: u64 = seq_text
+    .trim()
+    .parse()
+    .map_err(|e| Error::Corrupt(format!("current not a seq: {e}")))?;
+  st.fence_epoch = epoch.unwrap_or(0);
+  st.current_bytes = Some(cur);
+  let man_bytes = store
+    .get(&manifest_key(prefix, mseq))?
+    .ok_or_else(|| Error::Corrupt(format!("manifest {mseq} missing")))?;
+  let man = Manifest::decode(&man_bytes)?;
+  st.manifest_seq = man.seq;
+  st.next_segment_id = man.next_segment_id;
+  st.journal_seq = man.next_journal_seq;
+  for (name, pm) in man.partitions {
+    for seg in &pm.segments {
+      if let Some(index) = &seg.index {
+        index_cache.insert(seg.id, Arc::new(index.clone()));
+      }
+    }
+    let lock = partitions.create(&name);
+    lock.write().meta = pm.clone();
+    st.partitions.insert(name, pm);
+  }
+  st.published_min_wm = st
+    .partitions
+    .values()
+    .map(|pm| pm.watermark)
+    .min()
+    .unwrap_or(0);
+
+  // Replay the durable journal tail of this epoch above the watermarks.
+  let list = store.list(&journal_prefix_epoch(prefix, st.fence_epoch))?;
+  let mut max_seq = st.journal_seq;
+  let mut pending: Vec<(String, u64)> = Vec::new();
+  for k in &list {
+    let Some(s) = parse_tail_seq(k) else {
+      continue;
+    };
+    max_seq = max_seq.max(s);
+    st.journal_seqs.insert(s);
+    pending.push((k.clone(), s));
+  }
+  st.journal_seq = max_seq;
+  let min_wm = st.published_min_wm;
+  pending.sort_by_key(|(_, s)| *s);
+  for (key, s) in pending {
+    if s <= min_wm {
+      continue;
+    }
+    let Some(bytes) = store.get(&key)? else {
+      continue;
+    };
+    st.journal_sizes.insert(s, bytes.len() as u64);
+    for group in decode_group_stream(&bytes)? {
+      if group.epoch != st.fence_epoch {
+        continue;
+      }
+      apply_group_recover(&mut st, &group, partitions)?;
+    }
+  }
+  Ok(st)
+}
+
+/// One follower refresh: load a fresh read-only snapshot and swap it into the
+/// engine's view — global state first, then every published partition under
+/// its own write lock. Partitions the leader no longer publishes are marked
+/// dropped so reads observe the removal. No-op on a writer.
+fn refresh_follower(inner: &Inner) -> Result<()> {
+  if !inner.read_only.load(Ordering::SeqCst) {
+    return Ok(());
+  }
+  let cfg = inner.state.read().cfg.clone();
+  let scratch = PartitionTable::default();
+  let fresh = load_readonly_snapshot(&*inner.store, &cfg, &scratch, &inner.index_cache)?;
+
+  // Cheap change detection: skip the swap when the pointer and the journal set
+  // are unchanged (avoids lock churn on every poll tick).
+  {
+    let cur = inner.state.read();
+    if cur.current_bytes == fresh.current_bytes && cur.journal_seqs == fresh.journal_seqs {
+      return Ok(());
+    }
+  }
+
+  // Global metadata first...
+  {
+    let mut st = inner.state.write();
+    *st = fresh;
+  }
+  // ...then upsert every published partition under its own write lock.
+  for lock in scratch.snapshot() {
+    let target = inner.partitions.create(&lock.read().name.clone());
+    let mut t = target.write();
+    let s = lock.read();
+    t.meta = s.meta.clone();
+    t.mem = s.mem.clone();
+    t.mem_bytes = s.mem_bytes;
+    t.compacting = false;
+  }
+  // Mark partitions the leader no longer publishes as dropped.
+  let alive: std::collections::BTreeSet<String> =
+    inner.state.read().partitions.keys().cloned().collect();
+  for lock in inner.partitions.snapshot() {
+    let name = lock.read().name.clone();
+    if !alive.contains(&name) {
+      let mut ps = lock.write();
+      ps.mem.clear();
+      ps.mem_bytes = 0;
+      ps.meta.segments.clear();
+      ps.meta.watermark = 0;
+      ps.meta.dropped = true;
+    }
+  }
+  Ok(())
+}
+
+/// Background poller that keeps a follower's view close to the leader's
+/// published state. Exits once the engine is dropped (journal_stop).
+fn spawn_follower_refresh(inner: Arc<Inner>, interval: Duration) {
+  let weak = Arc::downgrade(&inner);
+  let stop = inner.journal_stop.clone();
+  thread::Builder::new()
+    .name("objectlsm-follower".into())
+    .spawn(move || {
+      loop {
+        thread::sleep(interval);
+        if stop.load(Ordering::SeqCst) {
+          return;
+        }
+        let Some(inner) = weak.upgrade() else {
+          return;
+        };
+        let _ = refresh_follower(&inner);
+      }
+    })
+    .ok();
 }
 
 /// Rebuild in-memory state from the durable manifest + journal tail, then run
@@ -289,6 +518,12 @@ fn recover(
       lock.write().meta = pm.clone();
       st.partitions.insert(name, pm);
     }
+    st.published_min_wm = st
+      .partitions
+      .values()
+      .map(|pm| pm.watermark)
+      .min()
+      .unwrap_or(0);
   }
 
   // Replay every journal group newer than its partition watermark.
@@ -443,6 +678,14 @@ fn publish_manifest(store: &dyn Store, st: &mut EngineState) -> Result<()> {
     store.put(&current_key(&st.cfg.prefix), &new_current)?;
   }
   st.current_bytes = Some(new_current);
+  // The mirror watermarks are now durable (this manifest references them), so
+  // journals folded by them may be garbage-collected from here on.
+  st.published_min_wm = st
+    .partitions
+    .values()
+    .map(|pm| pm.watermark)
+    .min()
+    .unwrap_or(0);
   Ok(())
 }
 
@@ -751,12 +994,11 @@ fn maybe_compact_all_state(
 /// Delete journal objects whose seq is at or below every partition watermark
 /// (they are folded into segments or were deliberately discarded).
 fn gc_journal(store: &dyn Store, st: &mut EngineState) {
-  let min_wm = st
-    .partitions
-    .values()
-    .map(|pm| pm.watermark)
-    .min()
-    .unwrap_or(0);
+  // Never delete beyond the watermark of the LAST SUCCESSFULLY PUBLISHED
+  // manifest: a flush whose publish failed (or a crash before publish) leaves
+  // journal objects as the only durable record, and deleting them would lose
+  // acknowledged writes on recovery.
+  let min_wm = st.published_min_wm;
   if min_wm == 0 {
     return;
   }
@@ -961,6 +1203,17 @@ impl Inner {
     self.partitions.get(name)
   }
 
+  /// Reject mutations on a read-only follower, then apply lease fencing for
+  /// writers. Every store-mutating entry point calls this instead of
+  /// [`Self::ensure_writer`] so a follower can never write journals, segments
+  /// or manifests into the shared bucket.
+  fn ensure_writable(&self) -> Result<()> {
+    if self.read_only.load(Ordering::SeqCst) {
+      return Err(Error::store("engine is a read-only follower"));
+    }
+    self.ensure_writer()
+  }
+
   /// Wait for any in-flight detached compaction on `name` to finish.
   fn wait_compaction_finished(&self, name: &str) {
     loop {
@@ -1002,7 +1255,7 @@ impl Inner {
     if ops.is_empty() {
       return Ok(());
     }
-    self.ensure_writer()?;
+    self.ensure_writable()?;
     let mut names: Vec<String> = ops.iter().map(|op| op.part.clone()).collect();
     names.sort();
     names.dedup();
@@ -1116,6 +1369,24 @@ impl Inner {
   /// Ensure a partition exists and is not marked dropped (re-create clears the
   /// dropped flag, keeping its watermark to avoid stale journal replays).
   pub(crate) fn touch_partition(&self, name: &str) -> Result<()> {
+    if self.read_only.load(Ordering::SeqCst) {
+      // Followers never create or resurrect partitions: a handle is only
+      // handed out for a partition the leader currently publishes (present in
+      // the local refreshed view and not dropped). Anything else errors so a
+      // follower can never publish a manifest into the shared bucket.
+      let Some(lock) = self.partitions.get(name) else {
+        return Err(Error::store(format!(
+          "read-only follower: partition {name} is not published"
+        )));
+      };
+      let ps = lock.read();
+      if ps.meta.dropped {
+        return Err(Error::store(format!(
+          "read-only follower: partition {name} was removed by the leader"
+        )));
+      }
+      return Ok(());
+    }
     self.ensure_writer()?;
     let lock = self.partitions.create(name);
     let mut ps = lock.write();
@@ -1243,7 +1514,7 @@ impl Inner {
   }
 
   pub(crate) fn clear_partition(&self, name: &str) -> Result<()> {
-    self.ensure_writer()?;
+    self.ensure_writable()?;
     // Gate deletes against readers (before taking the partition lock), and
     // publish the cleared manifest before deleting old objects: a crash only
     // leaves orphan objects, never a manifest pointing at deleted segments.
@@ -1276,7 +1547,7 @@ impl Inner {
   }
 
   pub(crate) fn rm_partition(&self, name: &str) -> Result<()> {
-    self.ensure_writer()?;
+    self.ensure_writable()?;
     let _del = self.readers.exclusive();
     self.wait_compaction_finished(name);
     let Some(lock) = self.partition_lock(name) else {
@@ -1307,13 +1578,13 @@ impl Inner {
 
   /// Flush + merge-compact a single partition.
   pub(crate) fn compact_partition(&self, name: &str) -> Result<()> {
-    self.ensure_writer()?;
+    self.ensure_writable()?;
     self.compact_partition_detached(name)
   }
 
   /// Flush + merge-compact every non-dropped partition.
   pub(crate) fn compact_all(&self) -> Result<()> {
-    self.ensure_writer()?;
+    self.ensure_writable()?;
     let pending: Vec<String> = self.state.read().pending_flushes.keys().cloned().collect();
     for name in pending {
       finish_partition_flush(self, &name)?;
@@ -1576,6 +1847,7 @@ impl Engine for ObjectLsm {
   }
 
   fn persist(&self) -> Result<()> {
+    self.inner.ensure_writable()?;
     // Strict mode: every committed group is already a durable journal object.
     // Windowed mode: force a synchronous flush so this call only returns once
     // everything acknowledged so far is durable.

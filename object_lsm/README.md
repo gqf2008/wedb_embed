@@ -20,7 +20,10 @@ crash:  current -> manifest -> replay journal groups newer than watermark
 write-adjacent maintenance:
   - merge compaction folds a partition's segments into one (upload -> publish
     manifest -> delete old objects) once max_segments_before_compact is hit
-  - applied journal groups (seq <= min partition watermark) are deleted
+  - applied journal groups (seq <= the last successfully PUBLISHED manifest
+  watermark) are deleted — journal GC never runs ahead of a durable manifest, so
+  a flush whose manifest publish failed can never lose its only-durable journal
+  objects (`failed_manifest_publish_keeps_journals_for_recovery`)
   - opening GCs segments not referenced by the current manifest and superseded
     manifest snapshots
 ```
@@ -230,3 +233,30 @@ directory in a fresh process to assert crash consistency:
 journal-after-commit, flush-after-compact, segment-upload-before-manifest,
 clear-publish-before-delete, compact-publish-before-delete.
 
+
+### Read replicas: followers over a shared prefix
+
+`ObjectLsm::open_follower(store, cfg, refresh)` opens a read-only engine over the
+SAME prefix a leader writes, without acquiring the lease and without ever
+writing to the store:
+
+- reads track the leader's *published* state: segments folded by a manifest
+  publish plus the durable journal tail (strict-mode / flushed group-commit
+  objects) above the manifest watermark;
+- a background poller (interval = `refresh`; `None` disables it — call
+  `engine.refresh()` manually, e.g. in tests) re-reads `current` and swaps a
+  fresh read-only snapshot into the engine's view;
+- every store-mutating call (insert/rm/clear/compact/persist/rm_partition)
+  fails with a read-only error, and opening/refreshing/reading a follower adds
+  or removes no objects (`follower_never_writes_to_the_store`);
+- followers cross fencing-epoch boundaries: after a leader failover they pick
+  up the successor's manifest and keep serving the union of published state;
+- caveats: visibility is bounded by what the leader made durable (a
+  group-commit ack still buffered in the leader is invisible) and refreshes are
+  eventually consistent; a read on any stale snapshot (not only a long-lived
+  iterator) can hit a segment the leader deleted after compaction, in which
+  case a Range GET error surfaces to the caller; a manual `refresh()` racing a
+  background poll can momentarily install an older snapshot.
+
+Live R2 test `r2_follower_reads_shared_bucket_prefix` verifies the read-replica
+topology on real Cloudflare R2.

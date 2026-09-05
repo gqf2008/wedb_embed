@@ -467,3 +467,69 @@ fn takeover_anchor_preserves_successor_acks_across_handoff() {
   );
   assert_eq!(p3.get(b"k052").unwrap().unwrap(), vec![b'y'; 96]);
 }
+/// Journal GC must never delete objects whose fold was not durably published:
+/// a flush that uploads a segment but fails to publish its manifest leaves the
+/// journal objects as the only durable record, and deleting them would lose
+/// acknowledged writes on recovery.
+#[derive(Clone)]
+struct FailManifestOnceStore {
+  inner: MemoryStore,
+  armed: Arc<AtomicBool>,
+}
+
+impl Store for FailManifestOnceStore {
+  fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    self.inner.get(key)
+  }
+  fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+    self.inner.get_range(key, offset, len)
+  }
+  fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+    // Fail the manifest SNAPSHOT put (not the current-pointer flip) exactly
+    // once, after the segment upload has already succeeded.
+    if key.contains("/manifest/")
+      && !key.ends_with("/current")
+      && self.armed.swap(false, Ordering::SeqCst)
+    {
+      return Err(wedb_object_lsm::Error::store(
+        "injected manifest put failure",
+      ));
+    }
+    self.inner.put(key, data)
+  }
+  fn delete(&self, key: &str) -> Result<()> {
+    self.inner.delete(key)
+  }
+  fn list(&self, prefix: &str) -> Result<Vec<String>> {
+    self.inner.list(prefix)
+  }
+}
+
+#[test]
+fn failed_manifest_publish_keeps_journals_for_recovery() {
+  let armed = Arc::new(AtomicBool::new(true));
+  let store = FailManifestOnceStore {
+    inner: MemoryStore::new(),
+    armed: armed.clone(),
+  };
+  // A one-byte budget forces a flush on the very first commit, so the segment
+  // upload happens and the manifest publish fails in the same commit.
+  let cfg = Config::new("ha/t9")
+    .max_memtable_bytes(1)
+    .max_segments_before_compact(1_000_000);
+  let db = ObjectLsm::open(Arc::new(store.clone()), cfg.clone()).unwrap();
+  let p = db.partition("data").unwrap();
+  // The journal PUT succeeds; the maintenance flush fails on manifest publish
+  // and that error is swallowed by the commit path.
+  p.insert(b"k1", b"v1").unwrap();
+  drop(p);
+  drop(db);
+
+  let db2 = ObjectLsm::open(Arc::new(store), cfg).unwrap();
+  let p2 = db2.partition("data").unwrap();
+  assert_eq!(
+    p2.get(b"k1").unwrap().unwrap(),
+    b"v1",
+    "acked write must survive a failed manifest publish (journal kept)"
+  );
+}

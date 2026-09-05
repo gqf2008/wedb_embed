@@ -254,6 +254,11 @@ pub struct EngineState {
   pub fence_epoch: u128,
   /// Raw bytes of the current manifest pointer as last seen/published.
   pub current_bytes: Option<Vec<u8>>,
+  /// Min partition watermark at the time of the LAST SUCCESSFUL manifest
+  /// publish. Journal GC only deletes objects at/below this bound, so a flush
+  /// whose manifest publish failed can never have its (still-only-durable)
+  /// journal objects garbage-collected.
+  pub published_min_wm: u64,
 }
 
 impl EngineState {
@@ -274,6 +279,7 @@ impl EngineState {
       pending_flushes: BTreeMap::new(),
       fence_epoch: 0,
       current_bytes: None,
+      published_min_wm: 0,
     }
   }
 

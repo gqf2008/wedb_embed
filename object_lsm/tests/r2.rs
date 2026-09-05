@@ -449,3 +449,75 @@ fn r2_same_prefix_auto_failover_after_leader_crash() -> wedb_object_lsm::Result<
   }
   Ok(())
 }
+
+/// Live read-replica over a shared bucket prefix on real R2: a leased leader
+/// publishes segments and keeps writing strict-mode journals; a follower that
+/// never acquires the lease tracks the leader's published state through
+/// refresh() and rejects mutations.
+#[test]
+fn r2_follower_reads_shared_bucket_prefix() -> wedb_object_lsm::Result<()> {
+  if !env_ok() {
+    eprintln!("R2 env not configured; skipping live test");
+    return Ok(());
+  }
+  let prefix = prefix();
+  let cfg = Config::new(&prefix)
+    .max_memtable_bytes(1 << 20)
+    .max_segments_before_compact(1_000_000);
+  let leader_opts = LeaseOptions {
+    owner: "w0".into(),
+    ttl: std::time::Duration::from_secs(300),
+    timeout: std::time::Duration::from_millis(1_000),
+    heartbeat: false,
+  };
+
+  let leader_store = Arc::new(R2Store::from_env()?);
+  let follower_store = Arc::new(R2Store::from_env()?);
+  let leader = ObjectLsm::open_leased(leader_store.clone(), cfg.clone(), leader_opts.clone())?;
+  let p = leader.partition("data")?;
+  let n = 8u32;
+  for i in 0..n {
+    p.insert(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes())?;
+  }
+  leader.compact()?; // publish the first manifest
+
+  let follower = ObjectLsm::open_follower(follower_store, cfg.clone(), None)?;
+  follower.refresh()?;
+  let pf = follower.partition("data")?;
+  assert_eq!(
+    pf.len()?,
+    n as usize,
+    "follower sees published segments on R2"
+  );
+  assert_eq!(pf.get(b"k007")?.unwrap(), b"v7");
+
+  // Unflushed strict-mode journals above the watermark stay visible through the
+  // durable journal tail.
+  for i in n..n + 3 {
+    p.insert(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes())?;
+  }
+  follower.refresh()?;
+  assert_eq!(
+    pf.len()?,
+    (n + 3) as usize,
+    "follower replays the leader's unflushed R2 journals"
+  );
+  assert_eq!(pf.get(b"k010")?.unwrap(), b"v10");
+
+  // A follower is read-only even against live R2.
+  let err = pf.insert(b"x", b"y").unwrap_err().to_string();
+  assert!(err.contains("read-only"), "follower write must fail: {err}");
+
+  // Fold again; the follower still agrees after a fresh manifest.
+  leader.compact()?;
+  follower.refresh()?;
+  assert_eq!(pf.len()?, (n + 3) as usize);
+  assert_eq!(pf.get(b"k003")?.unwrap(), b"v3");
+  drop(follower);
+  drop(leader);
+
+  for key in leader_store.list(&prefix)? {
+    let _ = leader_store.delete(&key);
+  }
+  Ok(())
+}
