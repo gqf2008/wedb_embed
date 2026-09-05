@@ -12,7 +12,7 @@ use std::{
 };
 
 use wedb_embed_engine::{Engine, Partition};
-use wedb_object_lsm::{Config, ObjectLsm, R2Store, Store, keys::segment_root};
+use wedb_object_lsm::{Config, LeaseOptions, ObjectLsm, R2Store, Store, keys::segment_root};
 
 fn env_ok() -> bool {
   ["R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
@@ -171,6 +171,96 @@ fn r2_multiple_instances_concurrent() -> wedb_object_lsm::Result<()> {
   let store = Arc::new(R2Store::from_env()?);
   for key in store.list(&prefix)? {
     let _ = store.delete(&key);
+  }
+  Ok(())
+}
+
+fn lease_opts(owner: &str) -> LeaseOptions {
+  LeaseOptions {
+    owner: owner.into(),
+    ttl: std::time::Duration::from_secs(300),
+    timeout: std::time::Duration::from_millis(800),
+    heartbeat: false,
+  }
+}
+
+#[test]
+fn r2_same_prefix_lease_fencing() -> wedb_object_lsm::Result<()> {
+  if !env_ok() {
+    eprintln!("R2 env not configured; skipping live test");
+    return Ok(());
+  }
+  let prefix = prefix();
+  let store = Arc::new(R2Store::from_env()?);
+
+  let e0 = ObjectLsm::open_leased(
+    store.clone(),
+    Config::new(&prefix)
+      .max_memtable_bytes(1 << 20)
+      .journal_window_ms(Some(10)),
+    lease_opts("w0"),
+  )?;
+  let p0 = e0.partition("data")?;
+  for j in 0..5u32 {
+    p0.insert(format!("w0-{j:02}").as_bytes(), b"v")?;
+  }
+  e0.compact()?; // fold into a manifest segment so the next epoch can read it
+
+  // A second writer on the SAME prefix must be refused while w0 holds lease.
+  let second = ObjectLsm::open_leased(
+    store.clone(),
+    Config::new(&prefix)
+      .max_memtable_bytes(1 << 20)
+      .journal_window_ms(Some(10)),
+    lease_opts("w1"),
+  );
+  assert!(
+    second.is_err(),
+    "second writer should not acquire the same-prefix lease"
+  );
+
+  // Dropping w0 releases the lease; a new writer can take over and see data.
+  drop(e0);
+  drop(p0);
+  let e1 = ObjectLsm::open_leased(
+    store.clone(),
+    Config::new(&prefix)
+      .max_memtable_bytes(1 << 20)
+      .journal_window_ms(Some(10)),
+    lease_opts("w1"),
+  )?;
+  let p1 = e1.partition("data")?;
+  assert_eq!(p1.len()?, 5, "takeover writer must see w0 data");
+  for j in 0..5u32 {
+    assert_eq!(
+      p1.get(format!("w0-{j:02}").as_bytes())?,
+      Some(b"v".to_vec())
+    );
+  }
+  for j in 0..5u32 {
+    p1.insert(format!("w1-{j:02}").as_bytes(), b"v")?;
+  }
+  e1.compact()?;
+  drop(e1);
+  drop(p1);
+
+  // Reopen after takeover and verify all writers' data is durable.
+  let store2 = Arc::new(R2Store::from_env()?);
+  let e2 = ObjectLsm::open_leased(
+    store2.clone(),
+    Config::new(&prefix)
+      .max_memtable_bytes(1 << 20)
+      .journal_window_ms(Some(10)),
+    lease_opts("w2"),
+  )?;
+  let p2 = e2.partition("data")?;
+  assert_eq!(p2.len()?, 10);
+  assert_eq!(p2.get(b"w0-00")?, Some(b"v".to_vec()));
+  assert_eq!(p2.get(b"w1-04")?, Some(b"v".to_vec()));
+
+  // Cleanup.
+  for key in store2.list(&prefix)? {
+    let _ = store2.delete(&key);
   }
   Ok(())
 }

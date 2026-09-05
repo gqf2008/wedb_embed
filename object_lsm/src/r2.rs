@@ -7,7 +7,8 @@ use std::{ops::Range, sync::Arc};
 
 use md5::{Digest, Md5};
 use object_store::{
-  ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, aws::AmazonS3Builder,
+  ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion,
+  aws::{AmazonS3Builder, S3ConditionalPut},
   path::Path as ObjPath,
 };
 use tokio::runtime::Runtime;
@@ -69,7 +70,10 @@ impl R2Store {
       .with_endpoint(&cfg.endpoint)
       .with_access_key_id(&cfg.access_key_id)
       .with_secret_access_key(&cfg.secret_access_key)
-      .with_virtual_hosted_style_request(false);
+      .with_virtual_hosted_style_request(false)
+      // Enable If-None-Match / If-Match conditional writes (required by the
+      // writer lease's create-if-absent and compare-and-swap on R2).
+      .with_conditional_put(S3ConditionalPut::ETagMatch);
     let inner = builder.build().map_err(Error::store)?;
     let rt = Runtime::new().map_err(|e| Error::store(format!("tokio runtime: {e}")))?;
     Ok(Self {
