@@ -126,9 +126,11 @@ after reopen. Reopen time grows sub-linearly with key count here (manifest /
 segment metadata, not a full key replay).
 
 Recovery replay fetches and decodes journal objects in parallel (bounded
-by CPU count, apply stays strictly seq-ordered): an offline 60k-key strict-mode
-reopen dropped from ~3.8 s (serial) to ~1.5 s (~2.5x); on R2 the per-object GET
-latency dominates, so the parallel fetch gives a larger win on failover/reopen.
+waves of 512 objects, up to 8 workers, apply stays strictly seq-ordered): an
+offline 60k-key strict-mode FileStore reopen measured ~5.6 s serial vs ~3.3 s
+parallel (~1.7x on this machine); on R2 the per-object GET latency dominates,
+so the parallel fetch gives a larger win on failover/reopen. Probe:
+cargo test --release -p wedb_object_lsm --test perf_reopen -- --ignored.
 
 ## Multi-instance shared bucket: lease + sharding
 

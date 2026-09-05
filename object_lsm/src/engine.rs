@@ -334,6 +334,68 @@ fn min_live_watermark(st: &EngineState) -> u64 {
 /// `(seq, object bytes len, decoded groups)` per replayed object, `None` when
 /// the object disappeared between listing and read.
 type DecodedJournalChunk = Vec<Option<(u64, u64, Vec<Group>)>>;
+
+/// Decode a contiguous run of journal objects (`keys` already in apply order)
+/// using up to `workers` threads. Short runs decode serially to avoid
+/// thread-spawn overhead. `None` marks an object that disappeared between
+/// listing and read (skipped, matching serial replay); results stay in input
+/// order.
+fn decode_journal_wave(
+  store: &dyn Store,
+  keys: &[(String, u64)],
+  workers: usize,
+) -> Result<DecodedJournalChunk> {
+  if keys.len() < 16 || workers <= 1 {
+    let mut out = Vec::with_capacity(keys.len());
+    for (key, seq) in keys {
+      match store.get(key) {
+        Ok(Some(bytes)) => {
+          out.push(Some((
+            *seq,
+            bytes.len() as u64,
+            decode_group_stream(&bytes)?,
+          )));
+        }
+        Ok(None) => out.push(None),
+        Err(e) => return Err(e),
+      }
+    }
+    return Ok(out);
+  }
+  let n = workers.min(keys.len());
+  let chunk = keys.len().div_ceil(n);
+  std::thread::scope(|scope| -> Result<DecodedJournalChunk> {
+    let mut handles = Vec::with_capacity(n);
+    for part in keys.chunks(chunk) {
+      handles.push(scope.spawn(move || -> Result<DecodedJournalChunk> {
+        let mut out = Vec::with_capacity(part.len());
+        for (key, seq) in part {
+          match store.get(key) {
+            Ok(Some(bytes)) => {
+              out.push(Some((
+                *seq,
+                bytes.len() as u64,
+                decode_group_stream(&bytes)?,
+              )));
+            }
+            Ok(None) => out.push(None),
+            Err(e) => return Err(e),
+          }
+        }
+        Ok(out)
+      }));
+    }
+    let mut out = Vec::with_capacity(keys.len());
+    for handle in handles {
+      out.extend(
+        handle
+          .join()
+          .map_err(|_| Error::store("recovery decode worker panicked"))??,
+      );
+    }
+    Ok(out)
+  })
+}
 /// Read-only snapshot of a leader prefix: parse `current` -> manifest and
 /// replay that epoch's journal tail above partition watermarks into
 /// `partitions`. Never uploads, compacts, publishes or GCs. A prefix with no
@@ -611,50 +673,23 @@ fn recover(
     // are already folded into durable segments; skip the whole object.
     .filter(|(_, s)| *s > min_wm)
     .collect();
-  // Fetch and decode journal objects in parallel — on an object store the
-  // per-object GET latency dominates recovery, so serial replay is the slow
-  // path of reopen/failover. The apply below stays strictly seq-ordered, and
-  // any missing object is skipped exactly as a serial replay would.
-  let decoded: Vec<DecodedJournalChunk> = if to_read.is_empty() {
-    Vec::new()
-  } else {
-    let workers = std::thread::available_parallelism()
-      .map(|n| n.get())
-      .unwrap_or(4)
-      .clamp(1, 8);
-    let chunk_size = to_read.len().div_ceil(workers).max(1);
-    let chunks: Vec<&[(String, u64)]> = to_read.chunks(chunk_size).collect();
-    std::thread::scope(|scope| -> Result<Vec<DecodedJournalChunk>> {
-      let mut handles = Vec::with_capacity(chunks.len());
-      for chunk in &chunks {
-        handles.push(scope.spawn(move || {
-          let mut out = Vec::with_capacity(chunk.len());
-          for (key, seq) in *chunk {
-            match store.get(key) {
-              Ok(Some(bytes)) => {
-                let groups: Vec<Group> = decode_group_stream(&bytes)?;
-                out.push(Some((*seq, bytes.len() as u64, groups)));
-              }
-              Ok(None) => out.push(None),
-              Err(e) => return Err(e),
-            }
-          }
-          Ok(out)
-        }));
-      }
-      let mut results = Vec::with_capacity(handles.len());
-      for handle in handles {
-        results.push(
-          handle
-            .join()
-            .map_err(|_| Error::store("recovery decode worker panicked"))??,
-        );
-      }
-      Ok(results)
-    })?
-  };
-  for chunk in decoded {
-    for item in chunk {
+  // Fetch and decode journal objects in parallel, in bounded waves — on an
+  // object store the per-object GET latency dominates recovery, so serial
+  // replay is the slow path of reopen/failover. The apply below stays strictly
+  // seq-ordered and any missing object is skipped exactly as serial replay
+  // would; one wave's decoded objects are applied before the next wave is
+  // fetched, keeping peak memory proportional to a wave instead of the whole
+  // journal tail.
+  let workers = std::thread::available_parallelism()
+    .map(|n| n.get())
+    .unwrap_or(4)
+    .clamp(1, 8);
+  const WAVE_OBJECTS: usize = 512;
+  let mut start = 0usize;
+  while start < to_read.len() {
+    let end = (start + WAVE_OBJECTS).min(to_read.len());
+    let wave = decode_journal_wave(store, &to_read[start..end], workers)?;
+    for item in wave {
       let Some((seq, len, groups)) = item else {
         continue;
       };
@@ -666,6 +701,7 @@ fn recover(
         apply_group_recover(&mut st, &group, partitions)?;
       }
     }
+    start = end;
   }
 
   // Flush replayed memtables that already exceeded the budget.

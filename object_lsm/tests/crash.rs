@@ -152,8 +152,9 @@ fn crash_child() {
       std::process::abort();
     }
     "leased_anchor" => {
-      // Leased writer acks 20 strict-mode writes and dies BEFORE publishing any
-      // manifest: recovery + takeover must replay the acked journals.
+      // Leased writer acks 20 strict-mode writes and dies before publishing its
+      // first data-bearing manifest: recovery + takeover must replay the acked
+      // journals.
       let cfg = Config::new("crash").max_memtable_bytes(1 << 20);
       let db = ObjectLsm::open_leased(
         store,
