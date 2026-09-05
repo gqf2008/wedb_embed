@@ -6,7 +6,10 @@
 
 #![cfg(feature = "r2")]
 
-use std::sync::Arc;
+use std::{
+  sync::{Arc, Barrier},
+  thread,
+};
 
 use wedb_embed_engine::{Engine, Partition};
 use wedb_object_lsm::{Config, ObjectLsm, R2Store, Store, keys::segment_root};
@@ -101,6 +104,73 @@ fn r2_engine_roundtrip() -> wedb_object_lsm::Result<()> {
   // cleanup: best-effort delete every object under the prefix
   for key in store2.list(&prefix)? {
     let _ = store2.delete(&key);
+  }
+  Ok(())
+}
+
+#[test]
+fn r2_multiple_instances_concurrent() -> wedb_object_lsm::Result<()> {
+  if !env_ok() {
+    eprintln!("R2 env not configured; skipping live test");
+    return Ok(());
+  }
+  let workers: usize = std::env::var("OBJLSM_CONCURRENCY")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(4);
+  let writes: usize = std::env::var("OBJLSM_WRITES")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(120);
+  let prefix = prefix();
+  let barrier = Arc::new(Barrier::new(workers));
+  let mut handles = Vec::with_capacity(workers);
+
+  for w in 0..workers {
+    let barrier = barrier.clone();
+    let base = prefix.clone();
+    handles.push(thread::spawn(move || -> wedb_object_lsm::Result<usize> {
+      let store = Arc::new(R2Store::from_env()?);
+      let cfg = Config::for_shard(&base, w as u64)
+        .max_memtable_bytes(64 * 1024)
+        .block_size(2048)
+        .max_segments_before_compact(1_000_000);
+      let eng = ObjectLsm::open(store.clone(), cfg.clone())?;
+      let p = eng.partition("data")?;
+      barrier.wait();
+      for j in 0..writes {
+        let k = format!("{w:02}-{j:05}");
+        let v = format!("w{w}:{j}");
+        p.insert(k.as_bytes(), v.as_bytes())?;
+      }
+      eng.compact()?;
+      drop(eng);
+
+      // Reopen from R2 and verify this writer's data survived.
+      let eng2 = ObjectLsm::open(store, cfg)?;
+      let p2 = eng2.partition("data")?;
+      assert_eq!(p2.len()?, writes, "writer {w} lost keys");
+      for j in (0..writes).step_by(7) {
+        let k = format!("{w:02}-{j:05}");
+        let v = format!("w{w}:{j}");
+        assert_eq!(p2.get(k.as_bytes())?, Some(v.into_bytes()));
+      }
+      Ok(writes)
+    }));
+  }
+
+  let mut total = 0usize;
+  for h in handles {
+    total += h
+      .join()
+      .map_err(|_| wedb_object_lsm::Error::store("writer panicked"))??;
+  }
+  assert_eq!(total, workers * writes);
+
+  // Cleanup: best-effort delete every object under the shared base prefix.
+  let store = Arc::new(R2Store::from_env()?);
+  for key in store.list(&prefix)? {
+    let _ = store.delete(&key);
   }
   Ok(())
 }
